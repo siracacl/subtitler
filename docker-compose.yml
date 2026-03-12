@@ -3,10 +3,7 @@ services:
     build: .
     ports:
       - "8642:8642"
-    # SYS_ADMIN capability needed to mount SMB shares inside the container
-    cap_add:
-      - SYS_ADMIN
-    # Required for CIFS mount
-    security_opt:
-      - apparmor:unconfined
+    # Privileged mode needed for mounting SMB/CIFS shares inside the container.
+    # cap_add: SYS_ADMIN alone fails on some platforms (Swarm, Portainer, NAS).
+    privileged: true
     env_file: stack.env
