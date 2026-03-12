@@ -524,7 +524,7 @@ class GUIHandler(BaseHTTPRequestHandler):
         import shutil
 
         folder = unquote(body.get("folder", ".")).strip()
-        subs_per_file = int(body.get("subs_per_file", 400))
+        subs_per_file = int(body.get("subs_per_stream", 400))
         concurrency = int(body.get("concurrency", 0)) or 10
 
         root = Path(folder)
@@ -596,7 +596,7 @@ class GUIHandler(BaseHTTPRequestHandler):
                 loop.close()
 
             avg_time = sum(times) / len(times)
-            total_subs = subs_per_file * total_files
+            total_subs = subs_per_file * total_streams
             # With concurrency, effective time = total / concurrency
             effective_concurrency = min(concurrency, total_subs)
             total_seconds = (avg_time * total_subs) / effective_concurrency
@@ -617,7 +617,7 @@ class GUIHandler(BaseHTTPRequestHandler):
                 "sample_times": [round(t, 2) for t in times],
                 "total_files": total_files,
                 "total_streams": total_streams,
-                "subs_per_file": subs_per_file,
+                "subs_per_stream": subs_per_file,
                 "total_subs_estimate": total_subs,
                 "concurrency": concurrency,
                 "total_time_estimate": time_str,
@@ -1129,7 +1129,7 @@ _HTML = r"""<!DOCTYPE html>
     <h3>Time Estimate</h3>
     <div class="estimate-form">
       <div class="estimate-field">
-        <label>Subtitles per file</label>
+        <label>Subtitles per stream</label>
         <input type="number" id="estSubsPerFile" value="400" min="1" />
       </div>
       <button class="btn-estimate" id="btnEstimate" onclick="runEstimate()" disabled>
@@ -1444,7 +1444,7 @@ function runEstimate() {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
-      folder, subs_per_file: subsPerFile, concurrency,
+      folder, subs_per_stream: subsPerFile, concurrency,
       language: language.length ? language : null,
       model, forced_only: forcedOnly
     })
@@ -1464,7 +1464,7 @@ function runEstimate() {
       'Avg per subtitle: ' + data.avg_seconds_per_sub + 's ' +
       '(sampled ' + data.sample_count + ' frames)<br>' +
       'First stream actual frames: ' + data.first_stream_actual_frames + '<br>' +
-      'Estimate: ' + data.total_files + ' files x ' + data.subs_per_file +
+      'Estimate: ' + data.total_streams + ' streams x ' + data.subs_per_stream +
       ' subs = ' + data.total_subs_estimate + ' total<br>' +
       'Concurrency: ' + data.concurrency + '<br>' +
       'Sample times: ' + data.sample_times.join('s, ') + 's';
