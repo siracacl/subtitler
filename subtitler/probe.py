@@ -9,7 +9,7 @@ IMAGE_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle"}
 
 def probe_subtitles(
     video: Path,
-    language: str | None = None,
+    language: list[str] | None = None,
     forced_only: bool = False,
 ) -> list[SubtitleStream]:
     cmd = [
@@ -43,7 +43,7 @@ def probe_subtitles(
             title=title,
         )
 
-        if language and lang != language:
+        if language and lang not in language:
             continue
         if forced_only and not forced:
             continue

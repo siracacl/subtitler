@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
         help="Video file or directory to process (default: current dir)",
     )
     p.add_argument("--config", help="Path to config YAML file")
-    p.add_argument("--language", help="Only process this language (e.g. fre, eng)")
+    p.add_argument("--language", nargs="+", help="Only process these languages (e.g. fre eng)")
     p.add_argument("--forced-only", action="store_true", help="Only process forced subtitle tracks")
     p.add_argument("--output-format", choices=["vtt", "srt"], help="Output format")
     p.add_argument("--output-dir", help="Output directory (default: alongside video)")

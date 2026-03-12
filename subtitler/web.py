@@ -31,6 +31,7 @@ SMB_BASE = Path("/mnt/smb")
 # Global state for SSE
 _event_queues: list[queue.Queue] = []
 _is_running = False
+_stop_requested = False
 
 
 def _broadcast(event_type: str, data: dict):
@@ -57,9 +58,19 @@ def _prepare_one_stream(stream, tmp_dir, label, si):
         return [], str(e)
 
 
+def _check_stop():
+    if _stop_requested:
+        raise _StopRequested()
+
+
+class _StopRequested(Exception):
+    pass
+
+
 def _run_pipeline(config: Config):
-    global _is_running
+    global _is_running, _stop_requested
     _is_running = True
+    _stop_requested = False
 
     try:
         root = Path(config.input_path)
@@ -88,123 +99,137 @@ def _run_pipeline(config: Config):
             stream_list.append(f"{s.source_file.name} [{codec}] {s.lang_code}{forced}")
         _broadcast("streams", {"streams": stream_list})
 
-        # Build work items (skip existing)
         import tempfile
         import shutil
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        work_items = []
+        # Group streams by video
+        from collections import defaultdict
+        video_streams: dict[Path, list[tuple[int, object]]] = defaultdict(list)
         for si, stream in enumerate(all_streams):
-            codec = "PGS" if stream.is_pgs else "VobSub"
-            label = f"{stream.source_file.stem} [{codec} {stream.lang_code}]"
-            out_path = build_output_path(stream, config.output_format, config.output_dir)
-
-            if out_path.exists():
-                _broadcast("stream_skip", {
-                    "stream_idx": si, "label": label,
-                    "reason": f"{out_path.name} already exists",
-                })
-                continue
-
-            tmp_dir = Path(tempfile.mkdtemp(prefix="subtitler_"))
-            work_items.append((si, stream, label, out_path, tmp_dir))
-
-        if not work_items:
-            _broadcast("done", {"message": "All outputs already exist"})
-            return
-
-        # Phase 1: Render all streams in parallel
-        _broadcast("status", {"message": f"Phase 1: Rendering {len(work_items)} streams in parallel..."})
-
-        prepared = {}  # si -> (frames, out_path, stream, tmp_dir)
-        with ThreadPoolExecutor(max_workers=min(len(work_items), 6)) as pool:
-            futures = {}
-            for si, stream, label, out_path, tmp_dir in work_items:
-                _broadcast("stream_start", {
-                    "stream_idx": si, "label": label,
-                    "total_streams": len(all_streams),
-                })
-                _broadcast("stream_phase", {"stream_idx": si, "phase": "Rendering..."})
-                fut = pool.submit(_prepare_one_stream, stream, tmp_dir, label, si)
-                futures[fut] = (si, stream, label, out_path, tmp_dir)
-
-            for fut in as_completed(futures):
-                si, stream, label, out_path, tmp_dir = futures[fut]
-                frames, error = fut.result()
-
-                if error:
-                    _broadcast("stream_error", {"stream_idx": si, "error": error})
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                elif not frames:
-                    _broadcast("stream_error", {"stream_idx": si, "error": "No frames found"})
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                else:
-                    _broadcast("stream_phase", {
-                        "stream_idx": si,
-                        "phase": f"{len(frames)} frames ready",
-                    })
-                    prepared[si] = (frames, out_path, stream, tmp_dir)
-
-        if not prepared:
-            _broadcast("done", {"message": "No frames to OCR"})
-            return
-
-        # Phase 2: OCR all streams
-        total_frames = sum(len(f) for f, _, _, _ in prepared.values())
-        _broadcast("status", {
-            "message": f"Phase 2: OCR {total_frames} frames across {len(prepared)} streams..."
-        })
+            video_streams[stream.source_file].append((si, stream))
 
         loop = asyncio.new_event_loop()
         ocr_client = OCRClient(config)
+        any_work = False
 
         try:
-            for si in sorted(prepared.keys()):
-                frames, out_path, stream, tmp_dir = prepared[si]
-                codec = "PGS" if stream.is_pgs else "VobSub"
-                label = f"{stream.source_file.stem} [{codec} {stream.lang_code}]"
-
-                _broadcast("stream_ocr_start", {
-                    "stream_idx": si,
-                    "total_frames": len(frames),
+            for vi, (video_path, streams) in enumerate(video_streams.items()):
+                _check_stop()
+                _broadcast("status", {
+                    "message": f"Video {vi+1}/{len(video_streams)}: {video_path.name}",
                 })
 
-                completed = 0
+                # Build work items for this video (skip existing)
+                work_items = []
+                for si, stream in streams:
+                    codec = "PGS" if stream.is_pgs else "VobSub"
+                    label = f"{stream.source_file.stem} [{codec} {stream.lang_code}]"
+                    out_path = build_output_path(stream, config.output_format, config.output_dir)
 
-                def on_progress(idx, result, _si=si, _total=len(frames)):
-                    nonlocal completed
-                    completed += 1
-                    _broadcast("stream_ocr_progress", {
-                        "stream_idx": _si,
-                        "completed": completed,
-                        "total": _total,
-                        "text": truncate(result.text, 80) if result.text else "",
+                    if out_path.exists():
+                        _broadcast("stream_skip", {
+                            "stream_idx": si, "label": label,
+                            "reason": f"{out_path.name} already exists",
+                        })
+                        continue
+
+                    tmp_dir = Path(tempfile.mkdtemp(prefix="subtitler_"))
+                    work_items.append((si, stream, label, out_path, tmp_dir))
+
+                if not work_items:
+                    continue
+
+                any_work = True
+
+                # Render all streams for this video in parallel
+                prepared = {}
+                with ThreadPoolExecutor(max_workers=min(len(work_items), 6)) as pool:
+                    futures = {}
+                    for si, stream, label, out_path, tmp_dir in work_items:
+                        _broadcast("stream_start", {
+                            "stream_idx": si, "label": label,
+                            "total_streams": len(all_streams),
+                        })
+                        _broadcast("stream_phase", {"stream_idx": si, "phase": "Rendering..."})
+                        fut = pool.submit(_prepare_one_stream, stream, tmp_dir, label, si)
+                        futures[fut] = (si, stream, label, out_path, tmp_dir)
+
+                    for fut in as_completed(futures):
+                        si, stream, label, out_path, tmp_dir = futures[fut]
+                        frames, error = fut.result()
+
+                        if error:
+                            _broadcast("stream_error", {"stream_idx": si, "error": error})
+                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                        elif not frames:
+                            _broadcast("stream_error", {"stream_idx": si, "error": "No frames found"})
+                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                        else:
+                            _broadcast("stream_phase", {
+                                "stream_idx": si,
+                                "phase": f"{len(frames)} frames ready",
+                            })
+                            prepared[si] = (frames, out_path, stream, tmp_dir)
+
+                if not prepared:
+                    continue
+
+                # OCR all streams for this video
+                for si in sorted(prepared.keys()):
+                    _check_stop()
+                    frames, out_path, stream, tmp_dir = prepared[si]
+                    codec = "PGS" if stream.is_pgs else "VobSub"
+                    label = f"{stream.source_file.stem} [{codec} {stream.lang_code}]"
+
+                    _broadcast("stream_ocr_start", {
+                        "stream_idx": si,
+                        "total_frames": len(frames),
                     })
 
-                results = loop.run_until_complete(
-                    ocr_client.ocr_frames(frames, stream.language, on_progress)
-                )
+                    completed = 0
 
-                write_subtitles(results, out_path, config.output_format)
-                errors = sum(1 for r in results if r.text.startswith("[OCR ERROR"))
-                _broadcast("stream_done", {
-                    "stream_idx": si,
-                    "output": out_path.name,
-                    "total_frames": len(frames),
-                    "errors": errors,
-                })
+                    def on_progress(idx, result, _si=si, _total=len(frames)):
+                        nonlocal completed
+                        completed += 1
+                        _broadcast("stream_ocr_progress", {
+                            "stream_idx": _si,
+                            "completed": completed,
+                            "total": _total,
+                            "text": truncate(result.text, 80) if result.text else "",
+                        })
 
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                    results = loop.run_until_complete(
+                        ocr_client.ocr_frames(frames, stream.language, on_progress)
+                    )
+
+                    write_subtitles(results, out_path, config.output_format)
+                    errors = sum(1 for r in results if r.text.startswith("[OCR ERROR"))
+                    _broadcast("stream_done", {
+                        "stream_idx": si,
+                        "output": out_path.name,
+                        "total_frames": len(frames),
+                        "errors": errors,
+                    })
+
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
         finally:
             loop.run_until_complete(ocr_client.close())
             loop.close()
 
-        _broadcast("done", {"message": "All done!"})
+        if not any_work:
+            _broadcast("done", {"message": "All outputs already exist"})
+        else:
+            _broadcast("done", {"message": "All done!"})
 
+    except _StopRequested:
+        _broadcast("done", {"message": "Stopped by user"})
     except Exception as e:
         _broadcast("done", {"message": f"Error: {e}"})
     finally:
         _is_running = False
+        _stop_requested = False
 
 
 class GUIHandler(BaseHTTPRequestHandler):
@@ -329,6 +354,14 @@ class GUIHandler(BaseHTTPRequestHandler):
             thread.start()
 
             self._json_response({"status": "started"})
+
+        elif parsed.path == "/stop":
+            global _stop_requested
+            if _is_running:
+                _stop_requested = True
+                self._json_response({"status": "stopping"})
+            else:
+                self._json_response({"status": "not_running"})
 
         elif parsed.path == "/smb/connect":
             length = int(self.headers.get("Content-Length", 0))
@@ -588,6 +621,8 @@ _HTML = r"""<!DOCTYPE html>
     color: #e0e0e0;
     font-size: 0.9rem;
   }
+  .option select[multiple] { min-height: 4.5rem; }
+  .option select[multiple] option { padding: 0.3rem 0.5rem; }
   .option select:focus, .option input:focus { outline: none; border-color: #4a9eff; }
   .checkbox-option {
     display: flex;
@@ -642,6 +677,10 @@ _HTML = r"""<!DOCTYPE html>
   .btn-start { background: #4a9eff; color: #fff; }
   .btn-start:hover { background: #3a8eef; }
   .btn-start:disabled { background: #333; color: #666; cursor: not-allowed; }
+  .btn-stop { background: #ff4a4a; color: #fff; }
+  .btn-stop:hover { background: #e03a3a; }
+  .btn-clear { background: #2a2a2a; color: #888; }
+  .btn-clear:hover { background: #333; color: #ccc; }
   .btn-smb { background: #2a3a2a; color: #afc; }
   .btn-smb:hover { background: #3a4a3a; }
 
@@ -844,8 +883,8 @@ _HTML = r"""<!DOCTYPE html>
 
   <div class="options">
     <div class="option">
-      <label>Language (empty = all)</label>
-      <select id="optLanguage"><option value="">All languages</option></select>
+      <label>Languages (none selected = all)</label>
+      <select id="optLanguage" multiple></select>
     </div>
     <div class="option">
       <label>Output Format</label>
@@ -874,6 +913,10 @@ _HTML = r"""<!DOCTYPE html>
     <button class="btn-start" id="btnStart" onclick="startProcessing()" disabled>
       Start OCR
     </button>
+    <button class="btn-stop" id="btnStop" onclick="stopProcessing()" style="display:none;">
+      Stop
+    </button>
+    <button class="btn-clear" onclick="clearLog()">Clear Log</button>
   </div>
 
   <div class="progress-area" id="progressArea">
@@ -1129,9 +1172,9 @@ function scanFolder() {
       '</div>'
     ).join('');
 
-    langSelect.innerHTML = '<option value="">All languages</option>';
+    langSelect.innerHTML = '';
     data.languages.forEach(l => {
-      langSelect.innerHTML += '<option value="' + l + '">' + l + '</option>';
+      langSelect.innerHTML += '<option value="' + l + '" selected>' + l + '</option>';
     });
 
     info.classList.add('visible');
@@ -1144,6 +1187,7 @@ function startProcessing() {
   if (!folder) return;
 
   document.getElementById('btnStart').disabled = true;
+  document.getElementById('btnStop').style.display = '';
   document.getElementById('progressArea').classList.add('visible');
   document.getElementById('log').innerHTML = '';
 
@@ -1210,6 +1254,7 @@ function startProcessing() {
     const d = JSON.parse(e.data);
     addLog('\n' + d.message, 'done');
     document.getElementById('btnStart').disabled = false;
+    document.getElementById('btnStop').style.display = 'none';
     document.getElementById('currentProgress').classList.remove('visible');
     eventSource.close();
   });
@@ -1219,13 +1264,23 @@ function startProcessing() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       folder: folder,
-      language: document.getElementById('optLanguage').value || null,
+      language: Array.from(document.getElementById('optLanguage').selectedOptions).map(o => o.value),
       forced_only: document.getElementById('optForced').checked,
       output_format: document.getElementById('optFormat').value,
       model: document.getElementById('optModel').value || null,
       concurrency: parseInt(document.getElementById('optConcurrency').value) || null,
     })
   });
+}
+
+function stopProcessing() {
+  fetch('/stop', {method: 'POST'});
+  document.getElementById('btnStop').style.display = 'none';
+}
+
+function clearLog() {
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('currentProgress').classList.remove('visible');
 }
 
 function addLog(text, cls) {
