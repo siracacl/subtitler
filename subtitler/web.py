@@ -334,9 +334,15 @@ class GUIHandler(BaseHTTPRequestHandler):
             })
 
         elif parsed.path == "/start":
-            if _is_running:
+            if _is_running and not _stop_requested:
                 self._json_response({"error": "Already running"}, 409)
                 return
+            # Wait briefly for a stopping pipeline to finish
+            if _is_running and _stop_requested:
+                for _ in range(50):
+                    import time; time.sleep(0.1)
+                    if not _is_running:
+                        break
 
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
@@ -1310,8 +1316,11 @@ function startProcessing() {
 }
 
 function stopProcessing() {
-  fetch('/stop', {method: 'POST'});
-  document.getElementById('btnStop').style.display = 'none';
+  fetch('/stop', {method: 'POST'}).then(() => {
+    document.getElementById('btnStart').disabled = false;
+    document.getElementById('btnStop').style.display = 'none';
+    document.getElementById('currentProgress').classList.remove('visible');
+  });
 }
 
 function clearLog() {
