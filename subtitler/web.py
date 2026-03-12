@@ -294,6 +294,7 @@ class GUIHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        global _stop_requested
         parsed = urlparse(self.path)
 
         if parsed.path == "/scan":
@@ -362,7 +363,6 @@ class GUIHandler(BaseHTTPRequestHandler):
             self._json_response({"status": "started"})
 
         elif parsed.path == "/stop":
-            global _stop_requested
             if _is_running:
                 _stop_requested = True
                 self._json_response({"status": "stopping"})
