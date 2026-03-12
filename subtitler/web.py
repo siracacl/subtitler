@@ -11,6 +11,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -419,6 +420,11 @@ class GUIHandler(BaseHTTPRequestHandler):
 
             self._json_response({"status": "started"})
 
+        elif parsed.path == "/estimate":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._handle_estimate(body)
+
         elif parsed.path == "/stop":
             if _is_running:
                 _stop_requested = True
@@ -510,6 +516,118 @@ class GUIHandler(BaseHTTPRequestHandler):
             self._json_response({"status": "disconnected"})
         except Exception as e:
             self._json_response({"error": str(e)}, 500)
+
+    def _handle_estimate(self, body: dict):
+        """Benchmark OCR speed with 10 sample subtitles and estimate total time."""
+        import random
+        import tempfile
+        import shutil
+
+        folder = unquote(body.get("folder", ".")).strip()
+        subs_per_file = int(body.get("subs_per_file", 400))
+        concurrency = int(body.get("concurrency", 0)) or 10
+
+        root = Path(folder)
+        if not root.exists():
+            self._json_response({"error": f"Path not found: {folder}"}, 400)
+            return
+
+        config = load_config(cli_overrides={
+            "input_path": folder,
+            "language": body.get("language") or None,
+            "forced_only": body.get("forced_only", False),
+            "model": body.get("model") or None,
+            "concurrency": 1,  # sequential for accurate timing
+        })
+
+        # Find first stream with subtitle frames
+        videos = scan_videos(root)
+        if not videos:
+            self._json_response({"error": "No video files found"}, 400)
+            return
+
+        all_streams = []
+        for v in videos:
+            streams = probe_subtitles(v, config.language, config.forced_only)
+            all_streams.extend(streams)
+
+        if not all_streams:
+            self._json_response({"error": "No subtitle streams found"}, 400)
+            return
+
+        total_files = len(videos)
+        total_streams = len(all_streams)
+
+        # Extract frames from the first stream
+        stream = all_streams[0]
+        tmp_dir = Path(tempfile.mkdtemp(prefix="subtitler_est_"))
+        try:
+            extracted = extract_stream(stream, tmp_dir)
+            if stream.is_pgs:
+                from .parsers.pgs import parse_pgs
+                frames = parse_pgs(extracted)
+            elif stream.is_vobsub:
+                from .parsers.vobsub import parse_vobsub_binary
+                frames = parse_vobsub_binary(stream.source_file, stream.index, tmp_dir)
+            else:
+                self._json_response({"error": f"Unsupported codec: {stream.codec}"}, 400)
+                return
+
+            if not frames:
+                self._json_response({"error": "No frames found in first stream"}, 400)
+                return
+
+            # Pick up to 10 random samples
+            sample_count = min(10, len(frames))
+            samples = random.sample(frames, sample_count)
+
+            # Benchmark OCR
+            loop = asyncio.new_event_loop()
+            ocr_client = OCRClient(config)
+            times = []
+
+            try:
+                for frame in samples:
+                    t0 = time.time()
+                    loop.run_until_complete(ocr_client.ocr_frame(frame, stream.language))
+                    times.append(time.time() - t0)
+            finally:
+                loop.run_until_complete(ocr_client.close())
+                loop.close()
+
+            avg_time = sum(times) / len(times)
+            total_subs = subs_per_file * total_files
+            # With concurrency, effective time = total / concurrency
+            effective_concurrency = min(concurrency, total_subs)
+            total_seconds = (avg_time * total_subs) / effective_concurrency
+
+            hours = int(total_seconds // 3600)
+            minutes = int((total_seconds % 3600) // 60)
+            secs = int(total_seconds % 60)
+            if hours > 0:
+                time_str = f"{hours}h {minutes}m {secs}s"
+            elif minutes > 0:
+                time_str = f"{minutes}m {secs}s"
+            else:
+                time_str = f"{secs}s"
+
+            self._json_response({
+                "avg_seconds_per_sub": round(avg_time, 2),
+                "sample_count": sample_count,
+                "sample_times": [round(t, 2) for t in times],
+                "total_files": total_files,
+                "total_streams": total_streams,
+                "subs_per_file": subs_per_file,
+                "total_subs_estimate": total_subs,
+                "concurrency": concurrency,
+                "total_time_estimate": time_str,
+                "total_seconds": round(total_seconds, 1),
+                "first_stream_actual_frames": len(frames),
+            })
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _json_response(self, data, status=200):
         self.send_response(status)
@@ -708,6 +826,66 @@ _HTML = r"""<!DOCTYPE html>
   .btn-clear:hover { background: #333; color: #ccc; }
   .btn-smb { background: #2a3a2a; color: #afc; }
   .btn-smb:hover { background: #3a4a3a; }
+  .btn-estimate { background: #2a2a3a; color: #aac; }
+  .btn-estimate:hover { background: #3a3a4a; }
+  .btn-estimate:disabled { background: #222; color: #555; cursor: not-allowed; }
+
+  /* Estimate panel */
+  .estimate-panel {
+    background: #1a1a1a;
+    border: 1px solid #222;
+    border-radius: 12px;
+    padding: 1.2rem 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  .estimate-panel h3 {
+    font-size: 0.95rem;
+    color: #ccc;
+    margin-bottom: 1rem;
+  }
+  .estimate-form {
+    display: flex;
+    gap: 0.8rem;
+    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+  .estimate-field label {
+    display: block;
+    font-size: 0.75rem;
+    color: #888;
+    margin-bottom: 0.3rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .estimate-field input {
+    width: 120px;
+    padding: 0.6rem 0.8rem;
+    background: #0f0f0f;
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #e0e0e0;
+    font-size: 0.9rem;
+  }
+  .estimate-field input:focus { outline: none; border-color: #4a9eff; }
+  .estimate-result {
+    margin-top: 1rem;
+    font-size: 0.9rem;
+    color: #ccc;
+    display: none;
+  }
+  .estimate-result.visible { display: block; }
+  .estimate-result .est-time {
+    font-size: 1.3rem;
+    font-weight: 700;
+    color: #4a9eff;
+    margin: 0.5rem 0;
+  }
+  .estimate-result .est-details {
+    font-size: 0.8rem;
+    color: #888;
+    font-family: 'SF Mono', Monaco, monospace;
+    line-height: 1.6;
+  }
 
   /* Progress area */
   .progress-area { display: none; }
@@ -943,6 +1121,24 @@ _HTML = r"""<!DOCTYPE html>
       <label style="margin: 0; text-transform: none; font-size: 0.95rem; color: #ccc;">
         Forced subtitles only
       </label>
+    </div>
+  </div>
+
+  <!-- Time Estimate -->
+  <div class="estimate-panel">
+    <h3>Time Estimate</h3>
+    <div class="estimate-form">
+      <div class="estimate-field">
+        <label>Subtitles per file</label>
+        <input type="number" id="estSubsPerFile" value="400" min="1" />
+      </div>
+      <button class="btn-estimate" id="btnEstimate" onclick="runEstimate()" disabled>
+        Estimate
+      </button>
+    </div>
+    <div class="estimate-result" id="estimateResult">
+      <div class="est-time" id="estTime"></div>
+      <div class="est-details" id="estDetails"></div>
     </div>
   </div>
 
@@ -1223,6 +1419,62 @@ function scanFolder() {
 
     info.classList.add('visible');
     document.getElementById('btnStart').disabled = data.streams === 0;
+    document.getElementById('btnEstimate').disabled = data.streams === 0;
+  });
+}
+
+function runEstimate() {
+  const folder = scannedFolder || document.getElementById('folderPath').value.trim();
+  if (!folder) return;
+
+  const btn = document.getElementById('btnEstimate');
+  const result = document.getElementById('estimateResult');
+  btn.disabled = true;
+  btn.textContent = 'Benchmarking...';
+  result.classList.remove('visible');
+
+  const subsPerFile = parseInt(document.getElementById('estSubsPerFile').value) || 400;
+  const concurrency = parseInt(document.getElementById('optConcurrency').value) || 10;
+  const langSelect = document.getElementById('optLanguage');
+  const language = Array.from(langSelect.selectedOptions).map(o => o.value);
+  const model = document.getElementById('optModel').value.trim() || undefined;
+  const forcedOnly = document.getElementById('optForced').checked;
+
+  fetch('/estimate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      folder, subs_per_file: subsPerFile, concurrency,
+      language: language.length ? language : null,
+      model, forced_only: forcedOnly
+    })
+  })
+  .then(r => r.json())
+  .then(data => {
+    btn.disabled = false;
+    btn.textContent = 'Estimate';
+    if (data.error) {
+      document.getElementById('estTime').textContent = 'Error: ' + data.error;
+      document.getElementById('estDetails').textContent = '';
+      result.classList.add('visible');
+      return;
+    }
+    document.getElementById('estTime').textContent = data.total_time_estimate;
+    document.getElementById('estDetails').innerHTML =
+      'Avg per subtitle: ' + data.avg_seconds_per_sub + 's ' +
+      '(sampled ' + data.sample_count + ' frames)<br>' +
+      'First stream actual frames: ' + data.first_stream_actual_frames + '<br>' +
+      'Estimate: ' + data.total_files + ' files x ' + data.subs_per_file +
+      ' subs = ' + data.total_subs_estimate + ' total<br>' +
+      'Concurrency: ' + data.concurrency + '<br>' +
+      'Sample times: ' + data.sample_times.join('s, ') + 's';
+    result.classList.add('visible');
+  })
+  .catch(e => {
+    btn.disabled = false;
+    btn.textContent = 'Estimate';
+    document.getElementById('estTime').textContent = 'Error: ' + e;
+    result.classList.add('visible');
   });
 }
 
