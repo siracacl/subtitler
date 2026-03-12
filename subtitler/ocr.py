@@ -74,7 +74,7 @@ class OCRClient:
                         ],
                     }
                 ],
-                "max_tokens": 300,
+                "max_tokens": 1000,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
 
