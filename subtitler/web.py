@@ -1233,8 +1233,7 @@ function addLog(text, cls) {
   const div = document.createElement('div');
   div.className = 'log-entry ' + cls;
   div.textContent = text;
-  log.appendChild(div);
-  log.scrollTop = log.scrollHeight;
+  log.prepend(div);
 }
 
 // Enter key on folder input
