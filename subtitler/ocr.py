@@ -34,8 +34,9 @@ def _language_name(code: str | None) -> str:
 
 
 class OCRClient:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, stop_check=None):
         self.config = config
+        self.stop_check = stop_check  # callable that returns True if stop requested
         self.semaphore = asyncio.Semaphore(config.concurrency)
         self.client = httpx.AsyncClient(
             timeout=60.0,
@@ -54,6 +55,8 @@ class OCRClient:
         language: str | None,
     ) -> OCRResult:
         async with self.semaphore:
+            if self.stop_check and self.stop_check():
+                return OCRResult(frame=frame, text="[STOPPED]")
             img_b64 = base64.b64encode(frame.image_bytes).decode("ascii")
             lang_name = _language_name(language)
             prompt = self.config.prompt.format(language=lang_name)
