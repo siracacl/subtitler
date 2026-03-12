@@ -1,0 +1,20 @@
+services:
+  subtitler:
+    build: .
+    ports:
+      - "8642:8642"
+    # SYS_ADMIN capability needed to mount SMB shares inside the container
+    cap_add:
+      - SYS_ADMIN
+    # Required for CIFS mount
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Required: your API key
+      - SUBTITLER_API_KEY=${SUBTITLER_API_KEY}
+      # Optional: override defaults
+      - SUBTITLER_BASE_URL=${SUBTITLER_BASE_URL:-https://openrouter.ai/api/v1}
+      - SUBTITLER_MODEL=${SUBTITLER_MODEL:-google/gemma-3-27b-it}
+      - SUBTITLER_CONCURRENCY=${SUBTITLER_CONCURRENCY:-10}
+      - SUBTITLER_OUTPUT_FORMAT=${SUBTITLER_OUTPUT_FORMAT:-vtt}
