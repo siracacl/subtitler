@@ -28,6 +28,63 @@ from .scanner import scan_videos
 _smb_mounts: dict[str, Path] = {}
 SMB_BASE = Path("/mnt/smb")
 
+
+def _mount_smb(server: str, share: str, username: str = "", password: str = "", domain: str = "") -> tuple[str | None, Path | None]:
+    """Mount an SMB share. Returns (error, mount_path)."""
+    mount_name = f"{server}_{share}".replace("/", "_").replace("\\", "_")
+    mount_path = SMB_BASE / mount_name
+
+    if mount_name in _smb_mounts:
+        return None, mount_path
+
+    mount_path.mkdir(parents=True, exist_ok=True)
+
+    unc = f"//{server}/{share}"
+    opts = ["vers=3.0"]
+    if username:
+        opts.append(f"username={username}")
+        opts.append(f"password={password}")
+        if domain:
+            opts.append(f"domain={domain}")
+    else:
+        opts.append("guest")
+
+    cmd = ["mount", "-t", "cifs", unc, str(mount_path), "-o", ",".join(opts)]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            mount_path.rmdir()
+            error = result.stderr.strip() or result.stdout.strip() or "Mount failed"
+            return error, None
+        _smb_mounts[mount_name] = mount_path
+        return None, mount_path
+    except subprocess.TimeoutExpired:
+        mount_path.rmdir()
+        return "Connection timed out", None
+    except Exception as e:
+        mount_path.rmdir()
+        return str(e), None
+
+
+def _auto_mount_smb():
+    """Auto-mount SMB share from SUBTITLER_SMB_* environment variables."""
+    server = os.environ.get("SUBTITLER_SMB_SERVER", "").strip()
+    share = os.environ.get("SUBTITLER_SMB_SHARE", "").strip()
+    if not server or not share:
+        return
+
+    username = os.environ.get("SUBTITLER_SMB_USER", "").strip()
+    password = os.environ.get("SUBTITLER_SMB_PASS", "")
+    domain = os.environ.get("SUBTITLER_SMB_DOMAIN", "").strip()
+
+    print(f"Auto-mounting SMB share //{server}/{share} ...")
+    error, mount_path = _mount_smb(server, share, username, password, domain)
+    if error:
+        print(f"  ERROR: {error}")
+    else:
+        print(f"  Mounted at {mount_path}")
+
 # Global state for SSE
 _event_queues: list[queue.Queue] = []
 _is_running = False
@@ -426,55 +483,17 @@ class GUIHandler(BaseHTTPRequestHandler):
             self._json_response({"error": "Server and share are required"}, 400)
             return
 
-        # Sanitize mount name
         mount_name = f"{server}_{share}".replace("/", "_").replace("\\", "_")
-        mount_path = SMB_BASE / mount_name
+        error, mount_path = _mount_smb(server, share, username, password, domain)
 
-        if mount_name in _smb_mounts:
-            self._json_response({
-                "status": "already_mounted",
-                "path": str(mount_path),
-                "name": mount_name,
-            })
-            return
-
-        mount_path.mkdir(parents=True, exist_ok=True)
-
-        # Build mount command
-        unc = f"//{server}/{share}"
-        opts = ["vers=3.0"]
-        if username:
-            opts.append(f"username={username}")
-            opts.append(f"password={password}")
-            if domain:
-                opts.append(f"domain={domain}")
-        else:
-            opts.append("guest")
-
-        cmd = ["mount", "-t", "cifs", unc, str(mount_path), "-o", ",".join(opts)]
-
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode != 0:
-                mount_path.rmdir()
-                error = result.stderr.strip() or result.stdout.strip() or "Mount failed"
-                self._json_response({"error": error}, 500)
-                return
-
-            _smb_mounts[mount_name] = mount_path
+        if error:
+            self._json_response({"error": error}, 500)
+        elif mount_name in _smb_mounts and mount_path:
             self._json_response({
                 "status": "mounted",
                 "path": str(mount_path),
                 "name": mount_name,
             })
-        except subprocess.TimeoutExpired:
-            mount_path.rmdir()
-            self._json_response({"error": "Connection timed out"}, 504)
-        except Exception as e:
-            mount_path.rmdir()
-            self._json_response({"error": str(e)}, 500)
 
     def _handle_smb_disconnect(self, body: dict):
         """Unmount an SMB share."""
@@ -1353,6 +1372,10 @@ def main():
     port = 8642
     # Bind to 0.0.0.0 in Docker, 127.0.0.1 otherwise
     bind = "0.0.0.0" if os.environ.get("SUBTITLER_DOCKER") else "127.0.0.1"
+
+    # Auto-mount SMB share from env vars if configured
+    _auto_mount_smb()
+
     server = HTTPServer((bind, port), GUIHandler)
     url = f"http://127.0.0.1:{port}"
     print(f"Subtitler GUI running at {url}")
