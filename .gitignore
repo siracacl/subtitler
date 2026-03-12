@@ -8,6 +8,7 @@ build/
 
 # Config with secrets
 .env
+stack.env
 subtitler.yaml
 subtitler.yml
 
