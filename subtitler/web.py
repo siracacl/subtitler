@@ -91,11 +91,39 @@ _event_queues: list[queue.Queue] = []
 _is_running = False
 _stop_requested = False
 
+# Progress tracking for reconnecting clients
+_progress = {
+    "total_streams": 0,
+    "done_streams": 0,
+    "current_label": "",
+    "current_completed": 0,
+    "current_total": 0,
+    "current_text": "",
+    "log": [],  # recent log messages
+}
+
 
 def _broadcast(event_type: str, data: dict):
     msg = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
     for q in _event_queues:
         q.put(msg)
+
+
+def _log(message: str):
+    """Add a message to the progress log (kept to last 200 entries)."""
+    _progress["log"].append(message)
+    if len(_progress["log"]) > 200:
+        _progress["log"] = _progress["log"][-200:]
+
+
+def _reset_progress():
+    _progress["total_streams"] = 0
+    _progress["done_streams"] = 0
+    _progress["current_label"] = ""
+    _progress["current_completed"] = 0
+    _progress["current_total"] = 0
+    _progress["current_text"] = ""
+    _progress["log"] = []
 
 
 def _prepare_one_stream(stream, tmp_dir, label, si):
@@ -129,11 +157,13 @@ def _run_pipeline(config: Config):
     global _is_running, _stop_requested
     _is_running = True
     _stop_requested = False
+    _reset_progress()
 
     try:
         root = Path(config.input_path)
         videos = scan_videos(root)
         _broadcast("status", {"message": f"Found {len(videos)} video file(s)"})
+        _log(f"Found {len(videos)} video file(s)")
 
         if not videos:
             _broadcast("done", {"message": "No video files found"})
@@ -149,6 +179,8 @@ def _run_pipeline(config: Config):
             return
 
         _broadcast("status", {"message": f"Found {len(all_streams)} subtitle stream(s)"})
+        _log(f"Found {len(all_streams)} subtitle stream(s)")
+        _progress["total_streams"] = len(all_streams)
 
         stream_list = []
         for s in all_streams:
@@ -168,7 +200,7 @@ def _run_pipeline(config: Config):
             video_streams[stream.source_file].append((si, stream))
 
         loop = asyncio.new_event_loop()
-        ocr_client = OCRClient(config)
+        ocr_client = OCRClient(config, stop_check=lambda: _stop_requested)
         any_work = False
 
         try:
@@ -244,25 +276,38 @@ def _run_pipeline(config: Config):
                         "stream_idx": si,
                         "total_frames": len(frames),
                     })
+                    _progress["current_label"] = label
+                    _progress["current_completed"] = 0
+                    _progress["current_total"] = len(frames)
+                    _progress["current_text"] = ""
 
                     completed = 0
 
                     def on_progress(idx, result, _si=si, _total=len(frames)):
                         nonlocal completed
                         completed += 1
+                        txt = truncate(result.text, 80) if result.text else ""
+                        _progress["current_completed"] = completed
+                        _progress["current_text"] = txt
                         _broadcast("stream_ocr_progress", {
                             "stream_idx": _si,
                             "completed": completed,
                             "total": _total,
-                            "text": truncate(result.text, 80) if result.text else "",
+                            "text": txt,
                         })
 
                     results = loop.run_until_complete(
                         ocr_client.ocr_frames(frames, stream.language, on_progress)
                     )
 
+                    _check_stop()
+
+                    # Filter out stopped results
+                    results = [r for r in results if r.text != "[STOPPED]"]
                     write_subtitles(results, out_path, config.output_format)
                     errors = sum(1 for r in results if r.text.startswith("[OCR ERROR"))
+                    _progress["done_streams"] += 1
+                    _log(f"Done: {out_path.name} ({len(frames)} frames, {errors} errors)")
                     _broadcast("stream_done", {
                         "stream_idx": si,
                         "output": out_path.name,
@@ -329,10 +374,11 @@ class GUIHandler(BaseHTTPRequestHandler):
                 _event_queues.remove(q)
 
         elif parsed.path == "/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"running": _is_running}).encode())
+            self._json_response({
+                "running": _is_running,
+                "stopping": _stop_requested,
+                "progress": _progress if _is_running else None,
+            })
 
         elif parsed.path == "/browse":
             qs = parse_qs(parsed.query)
@@ -1614,6 +1660,121 @@ document.getElementById('folderPath').addEventListener('keydown', e => {
 
 // Load mounts on startup
 refreshMounts();
+
+// Check for running job on page load
+fetch('/status').then(r => r.json()).then(data => {
+  if (!data.running) return;
+  const p = data.progress;
+  if (!p) return;
+
+  // Show progress area with current state
+  document.getElementById('btnStart').disabled = true;
+  document.getElementById('btnStop').style.display = '';
+  document.getElementById('progressArea').classList.add('visible');
+
+  // Restore log
+  const log = document.getElementById('log');
+  p.log.forEach(msg => {
+    const div = document.createElement('div');
+    div.className = 'log-entry status';
+    div.textContent = msg;
+    log.prepend(div);
+  });
+
+  // Restore overall progress
+  if (p.total_streams > 0) {
+    document.getElementById('opCount').textContent =
+      p.done_streams + '/' + p.total_streams + ' streams';
+    const pct = (p.done_streams / p.total_streams * 100).toFixed(1);
+    document.getElementById('opFill').style.width = pct + '%';
+  }
+
+  // Restore current stream progress
+  if (p.current_total > 0 && p.current_completed < p.current_total) {
+    const cp = document.getElementById('currentProgress');
+    cp.classList.add('visible');
+    document.getElementById('cpLabel').textContent = p.current_label || 'OCR in progress...';
+    document.getElementById('cpCount').textContent =
+      p.current_completed + '/' + p.current_total;
+    const pct = (p.current_completed / p.current_total * 100).toFixed(1);
+    document.getElementById('cpFill').style.width = pct + '%';
+    document.getElementById('cpText').textContent = p.current_text || '';
+  }
+
+  // Connect to SSE for live updates from here on
+  let totalStreams = p.total_streams;
+  let doneStreams = p.done_streams;
+
+  function updateOverall() {
+    document.getElementById('opCount').textContent = doneStreams + '/' + totalStreams + ' streams';
+    const pct = totalStreams > 0 ? (doneStreams / totalStreams * 100).toFixed(1) : 0;
+    document.getElementById('opFill').style.width = pct + '%';
+  }
+
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource('/events');
+
+  eventSource.addEventListener('stream_ocr_progress', e => {
+    const d = JSON.parse(e.data);
+    const pct = (d.completed / d.total * 100).toFixed(1);
+    document.getElementById('cpCount').textContent = d.completed + '/' + d.total;
+    document.getElementById('cpFill').style.width = pct + '%';
+    document.getElementById('cpText').textContent = d.text;
+  });
+
+  eventSource.addEventListener('stream_ocr_start', e => {
+    const d = JSON.parse(e.data);
+    const cp = document.getElementById('currentProgress');
+    cp.classList.add('visible');
+    document.getElementById('cpLabel').textContent = 'OCR in progress...';
+    document.getElementById('cpCount').textContent = '0/' + d.total_frames;
+    document.getElementById('cpFill').style.width = '0%';
+    document.getElementById('cpText').textContent = '';
+  });
+
+  eventSource.addEventListener('stream_start', e => {
+    const d = JSON.parse(e.data);
+    addLog('[' + (d.stream_idx+1) + '/' + d.total_streams + '] ' + d.label, 'phase');
+  });
+
+  eventSource.addEventListener('stream_done', e => {
+    const d = JSON.parse(e.data);
+    let msg = '  Done -> ' + d.output + ' (' + d.total_frames + ' frames)';
+    if (d.errors > 0) msg += ' [' + d.errors + ' errors]';
+    addLog(msg, 'done');
+    doneStreams++;
+    updateOverall();
+    document.getElementById('currentProgress').classList.remove('visible');
+  });
+
+  eventSource.addEventListener('stream_error', e => {
+    const d = JSON.parse(e.data);
+    addLog('  ' + d.error, 'error');
+    doneStreams++;
+    updateOverall();
+    document.getElementById('currentProgress').classList.remove('visible');
+  });
+
+  eventSource.addEventListener('stream_skip', e => {
+    const d = JSON.parse(e.data);
+    addLog('  Skip: ' + d.label + ' (' + d.reason + ')', 'skip');
+    doneStreams++;
+    updateOverall();
+  });
+
+  eventSource.addEventListener('status', e => {
+    addLog(JSON.parse(e.data).message, 'status');
+  });
+
+  eventSource.addEventListener('done', e => {
+    const d = JSON.parse(e.data);
+    addLog('\n' + d.message, 'done');
+    document.getElementById('btnStart').disabled = false;
+    document.getElementById('btnStop').style.display = 'none';
+    document.getElementById('currentProgress').classList.remove('visible');
+    eventSource.close();
+  });
+});
 </script>
 </body>
 </html>
