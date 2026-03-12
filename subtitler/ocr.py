@@ -75,6 +75,7 @@ class OCRClient:
                     }
                 ],
                 "max_tokens": 300,
+                "chat_template_kwargs": {"enable_thinking": False},
             }
 
             url = f"{self.config.base_url.rstrip('/')}/chat/completions"
