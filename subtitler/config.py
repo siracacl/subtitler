@@ -33,7 +33,7 @@ class Config:
     concurrency: int = DEFAULTS["concurrency"]
     output_format: str = DEFAULTS["output_format"]
     prompt: str = DEFAULTS["prompt"]
-    language: str | None = None
+    language: list[str] | None = None
     forced_only: bool = False
     dry_run: bool = False
     output_dir: str | None = None
@@ -57,7 +57,7 @@ _ENV_MAP = {
     "SUBTITLER_CONCURRENCY": ("concurrency", int),
     "SUBTITLER_OUTPUT_FORMAT": ("output_format", str),
     "SUBTITLER_PROMPT": ("prompt", str),
-    "SUBTITLER_LANGUAGE": ("language", str),
+    "SUBTITLER_LANGUAGE": ("language", list),
     "SUBTITLER_FORCED_ONLY": ("forced_only", bool),
     "SUBTITLER_OUTPUT_DIR": ("output_dir", str),
 }
@@ -75,6 +75,8 @@ def _load_env() -> dict:
             result[config_key] = int(val)
         elif typ is bool:
             result[config_key] = val.lower() in ("1", "true", "yes")
+        elif typ is list:
+            result[config_key] = [v.strip() for v in val.split(",") if v.strip()]
         else:
             result[config_key] = val
     return result
