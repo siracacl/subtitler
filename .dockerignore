@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+*.egg-info
+.git
+.env
+subtitler.yaml
+subtitler.yml
+*.vtt
+*.srt
