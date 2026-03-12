@@ -1315,7 +1315,7 @@ function browseTo(path) {
 
     // Parent directory link
     if (data.parent) {
-      html += '<li class="file-item dir" ondblclick="browseTo(\'' +
+      html += '<li class="file-item dir" onclick="browseTo(\'' +
         escHtml(data.parent) + '\')">' +
         '<span class="file-icon">&#x1F4C1;</span>' +
         '<span class="file-name">..</span>' +
@@ -1324,7 +1324,7 @@ function browseTo(path) {
 
     data.entries.forEach(e => {
       if (e.type === 'dir') {
-        html += '<li class="file-item dir" ondblclick="browseTo(\'' +
+        html += '<li class="file-item dir" onclick="browseTo(\'' +
           escHtml(e.path) + '\')">' +
           '<span class="file-icon">&#x1F4C1;</span>' +
           '<span class="file-name">' + escHtml(e.name) + '</span>' +
