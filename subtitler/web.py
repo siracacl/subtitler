@@ -708,6 +708,18 @@ _HTML = r"""<!DOCTYPE html>
   .log-entry.error { color: #ff4a4a; }
   .log-entry.skip { color: #666; }
 
+  /* Overall progress bar */
+  .overall-progress { margin-bottom: 1rem; }
+  .overall-progress .info {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 0.4rem;
+    font-size: 0.85rem;
+  }
+  .overall-progress .info .label { color: #ccc; }
+  .overall-progress .info .count { color: #888; }
+  .overall-progress .progress-bar .fill { background: #4aff9e; }
+
   /* Current progress bar */
   .current-progress { margin-bottom: 1rem; display: none; }
   .current-progress.visible { display: block; }
@@ -921,6 +933,13 @@ _HTML = r"""<!DOCTYPE html>
 
   <div class="progress-area" id="progressArea">
     <h2>Progress</h2>
+    <div class="overall-progress" id="overallProgress">
+      <div class="info">
+        <span class="label">Overall</span>
+        <span class="count" id="opCount">0/0 streams</span>
+      </div>
+      <div class="progress-bar"><div class="fill" id="opFill"></div></div>
+    </div>
     <div class="current-progress" id="currentProgress">
       <div class="info">
         <span class="label" id="cpLabel">...</span>
@@ -1191,6 +1210,15 @@ function startProcessing() {
   document.getElementById('progressArea').classList.add('visible');
   document.getElementById('log').innerHTML = '';
 
+  let totalStreams = 0;
+  let doneStreams = 0;
+
+  function updateOverall() {
+    document.getElementById('opCount').textContent = doneStreams + '/' + totalStreams + ' streams';
+    const pct = totalStreams > 0 ? (doneStreams / totalStreams * 100).toFixed(1) : 0;
+    document.getElementById('opFill').style.width = pct + '%';
+  }
+
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/events');
 
@@ -1200,6 +1228,8 @@ function startProcessing() {
 
   eventSource.addEventListener('streams', e => {
     const d = JSON.parse(e.data);
+    totalStreams = d.streams.length;
+    updateOverall();
     d.streams.forEach(s => addLog('  ' + s, 'status'));
   });
 
@@ -1236,18 +1266,24 @@ function startProcessing() {
     let msg = '  Done -> ' + d.output + ' (' + d.total_frames + ' frames)';
     if (d.errors > 0) msg += ' [' + d.errors + ' errors]';
     addLog(msg, 'done');
+    doneStreams++;
+    updateOverall();
     document.getElementById('currentProgress').classList.remove('visible');
   });
 
   eventSource.addEventListener('stream_error', e => {
     const d = JSON.parse(e.data);
     addLog('  ' + d.error, 'error');
+    doneStreams++;
+    updateOverall();
     document.getElementById('currentProgress').classList.remove('visible');
   });
 
   eventSource.addEventListener('stream_skip', e => {
     const d = JSON.parse(e.data);
     addLog('  Skip: ' + d.label + ' (' + d.reason + ')', 'skip');
+    doneStreams++;
+    updateOverall();
   });
 
   eventSource.addEventListener('done', e => {
