@@ -253,7 +253,7 @@ MKV, MP4, AVI, M4V, TS, M2TS, VOB, MPG, MPEG, WMV, OGM, MOV
 
 ## Recommended models
 
-**Personal recommendation: `qwen/qwen2.5-vl-7b`** - Fast, accurate, and small enough to run locally on an M4 Mac Mini at ~22 tokens/s. In testing, it produced better OCR results than the larger Gemma 3 27B model, particularly with accented characters and multilingual text. It's the best balance of speed, accuracy, and resource usage for subtitle OCR. In general, I'd recommend to turn off thinking/reasoning (where applicable) - in my testing this lead to "corrected" subtitles, i.e. the LLM sometimes not returning text true to the original.
+**Personal recommendation: `qwen/qwen2.5-vl-7b`** - Fast, accurate, and small enough to run locally on an M4 Mac Mini at ~22 tokens/s. In testing, it produced better OCR results than the larger Gemma 3 27B model, particularly with accented characters and multilingual text. It's the best balance of speed, accuracy, and resource usage for subtitle OCR. In general, I'd recommend to turn off thinking/reasoning (where applicable) - in my testing this led to "corrected" subtitles, i.e. the LLM sometimes not returning text true to the original.
 
 | Model | Best for | Notes |
 |---|---|---|
