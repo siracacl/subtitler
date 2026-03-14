@@ -140,8 +140,19 @@ class OCRClient:
             if on_progress:
                 on_progress(idx, result)
 
-        tasks = [process(i, f) for i, f in enumerate(frames)]
-        await asyncio.gather(*tasks)
+        tasks = [asyncio.ensure_future(process(i, f)) for i, f in enumerate(frames)]
+
+        # Poll for completion, cancel remaining on stop
+        while tasks:
+            done, tasks_set = await asyncio.wait(tasks, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+            tasks = list(tasks_set)
+            if self.stop_check and self.stop_check():
+                for t in tasks:
+                    t.cancel()
+                # Wait for cancellations to propagate
+                if tasks:
+                    await asyncio.wait(tasks, timeout=5)
+                break
 
         return [r for r in results if r is not None]
 
@@ -221,7 +232,17 @@ class MultiOCRClient:
             if on_progress:
                 on_progress(idx, result)
 
-        tasks = [process(i, f) for i, f in enumerate(frames)]
-        await asyncio.gather(*tasks)
+        tasks = [asyncio.ensure_future(process(i, f)) for i, f in enumerate(frames)]
+
+        # Poll for completion, cancel remaining on stop
+        while tasks:
+            done, tasks_set = await asyncio.wait(tasks, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+            tasks = list(tasks_set)
+            if self.stop_check and self.stop_check():
+                for t in tasks:
+                    t.cancel()
+                if tasks:
+                    await asyncio.wait(tasks, timeout=5)
+                break
 
         return [r for r in results if r is not None]
