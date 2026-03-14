@@ -53,26 +53,20 @@ class OCRClient:
             self.prompt = config.prompt if config else "Read the subtitle text in this image. The language is {language}. Return ONLY the subtitle text, nothing else. Preserve line breaks exactly as shown."
             self.semaphore = asyncio.Semaphore(server.concurrency)
             self.server_name = server.name
-            self.client = httpx.AsyncClient(
-                timeout=60.0,
-                headers={
-                    "Authorization": f"Bearer {server.api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
+            headers = {"Content-Type": "application/json"}
+            if server.api_key:
+                headers["Authorization"] = f"Bearer {server.api_key}"
+            self.client = httpx.AsyncClient(timeout=60.0, headers=headers)
         elif config:
             self.base_url = config.base_url
             self.model = config.model
             self.prompt = config.prompt
             self.semaphore = asyncio.Semaphore(config.concurrency)
             self.server_name = "default"
-            self.client = httpx.AsyncClient(
-                timeout=60.0,
-                headers={
-                    "Authorization": f"Bearer {config.api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
+            headers = {"Content-Type": "application/json"}
+            if config.api_key:
+                headers["Authorization"] = f"Bearer {config.api_key}"
+            self.client = httpx.AsyncClient(timeout=60.0, headers=headers)
         else:
             raise ValueError("Either config or server must be provided")
 
