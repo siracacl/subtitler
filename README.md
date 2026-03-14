@@ -41,7 +41,7 @@ The VobSub parser is a direct port of Subtitle Edit's own decoder, so credit whe
 cat > docker-compose.yml <<'EOF'
 services:
   subtitler:
-    image: ghcr.io/yourusername/subtitler:latest
+    image: ghcr.io/siracacl/subtitler:latest
     ports:
       - "8642:8642"
     privileged: true
@@ -66,7 +66,7 @@ Open `http://localhost:8642` in your browser.
 ### Build from source
 
 ```bash
-git clone https://github.com/yourusername/subtitler.git
+git clone https://github.com/siracacl/subtitler.git
 cd subtitler
 cp stack.env.example stack.env
 docker compose up --build
