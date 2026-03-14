@@ -213,7 +213,7 @@ class MultiOCRClient:
                     on_progress(idx, result)
                 return
 
-            # Round-robin across active clients
+            # Distribute evenly across active clients
             client_idx, client = active[idx % len(active)]
             result = await client.ocr_frame(frame, language)
 
