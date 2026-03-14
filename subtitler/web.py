@@ -248,43 +248,41 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
 
                 any_work = True
 
-                # Render all streams for this video in parallel
-                prepared = {}
-                with ThreadPoolExecutor(max_workers=min(len(work_items), 6)) as pool:
-                    futures = {}
-                    for si, stream, label, out_path, tmp_dir in work_items:
-                        _broadcast("stream_start", {
-                            "stream_idx": si, "label": label,
-                            "total_streams": len(all_streams),
-                        })
-                        _broadcast("stream_phase", {"stream_idx": si, "phase": "Rendering..."})
-                        fut = pool.submit(_prepare_one_stream, stream, tmp_dir, label, si)
-                        futures[fut] = (si, stream, label, out_path, tmp_dir)
+                # Extract streams in background, OCR as soon as each is ready
+                extract_pool = ThreadPoolExecutor(max_workers=min(len(work_items), 6))
+                futures = {}
+                for si, stream, label, out_path, tmp_dir in work_items:
+                    _broadcast("stream_start", {
+                        "stream_idx": si, "label": label,
+                        "total_streams": len(all_streams),
+                    })
+                    _broadcast("stream_phase", {"stream_idx": si, "phase": "Extracting..."})
+                    fut = extract_pool.submit(_prepare_one_stream, stream, tmp_dir, label, si)
+                    futures[fut] = (si, stream, label, out_path, tmp_dir)
 
-                    for fut in as_completed(futures):
-                        si, stream, label, out_path, tmp_dir = futures[fut]
-                        frames, error = fut.result()
+                # Process each stream as soon as its extraction completes
+                for fut in as_completed(futures):
+                    si, stream, label, out_path, tmp_dir = futures[fut]
+                    frames, error = fut.result()
 
-                        if error:
-                            _broadcast("stream_error", {"stream_idx": si, "error": error})
-                            shutil.rmtree(tmp_dir, ignore_errors=True)
-                        elif not frames:
-                            _broadcast("stream_error", {"stream_idx": si, "error": "No frames found"})
-                            shutil.rmtree(tmp_dir, ignore_errors=True)
-                        else:
-                            _broadcast("stream_phase", {
-                                "stream_idx": si,
-                                "phase": f"{len(frames)} frames ready",
-                            })
-                            prepared[si] = (frames, out_path, stream, tmp_dir)
+                    if error:
+                        _broadcast("stream_error", {"stream_idx": si, "error": error})
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        _progress["done_streams"] += 1
+                        continue
+                    if not frames:
+                        _broadcast("stream_error", {"stream_idx": si, "error": "No frames found"})
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        _progress["done_streams"] += 1
+                        continue
 
-                if not prepared:
-                    continue
+                    _broadcast("stream_phase", {
+                        "stream_idx": si,
+                        "phase": f"{len(frames)} frames ready, starting OCR...",
+                    })
 
-                # OCR all streams for this video
-                for si in sorted(prepared.keys()):
                     _check_stop()
-                    frames, out_path, stream, tmp_dir = prepared[si]
+
                     codec = "PGS" if stream.is_pgs else "VobSub"
                     label = f"{stream.source_file.stem} [{codec} {stream.lang_code}]"
 
@@ -332,6 +330,8 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
                     })
 
                     shutil.rmtree(tmp_dir, ignore_errors=True)
+
+                extract_pool.shutdown(wait=False)
 
         finally:
             loop.run_until_complete(ocr_client.close())
