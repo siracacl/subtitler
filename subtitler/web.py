@@ -289,6 +289,7 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
                             "stream_idx": si, "label": label,
                             "reason": f"{out_path.name} already exists",
                         })
+                        _progress["done_streams"] += 1
                         continue
 
                     tmp_dir = Path(tempfile.mkdtemp(prefix="subtitler_"))
