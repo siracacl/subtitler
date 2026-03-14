@@ -14,6 +14,7 @@ import threading
 import time
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -100,6 +101,11 @@ _progress = {
     "current_total": 0,
     "current_text": "",
     "log": [],  # recent log messages
+    "start_time": 0,
+    "total_subs_done": 0,
+    "total_subs_estimate": 0,  # estimated total across all streams
+    "eta_seconds": 0,
+    "eta_finish": "",
 }
 
 
@@ -124,6 +130,47 @@ def _reset_progress():
     _progress["current_total"] = 0
     _progress["current_text"] = ""
     _progress["log"] = []
+    _progress["start_time"] = time.time()
+    _progress["total_subs_done"] = 0
+    _progress["total_subs_estimate"] = 0
+    _progress["eta_seconds"] = 0
+    _progress["eta_finish"] = ""
+
+
+def _update_eta():
+    """Recalculate ETA based on completed subtitles and elapsed time."""
+    done = _progress["total_subs_done"]
+    total = _progress["total_subs_estimate"]
+    if done < 1 or total < 1:
+        return
+    elapsed = time.time() - _progress["start_time"]
+    avg_per_sub = elapsed / done
+    remaining = total - done
+    eta_seconds = avg_per_sub * remaining
+    _progress["eta_seconds"] = eta_seconds
+
+    from datetime import datetime, timedelta
+    finish_time = datetime.now() + timedelta(seconds=eta_seconds)
+    _progress["eta_finish"] = finish_time.strftime("%H:%M")
+
+    # Format duration
+    h = int(eta_seconds // 3600)
+    m = int((eta_seconds % 3600) // 60)
+    s = int(eta_seconds % 60)
+    if h > 0:
+        dur = f"{h}h {m}m"
+    elif m > 0:
+        dur = f"{m}m {s}s"
+    else:
+        dur = f"{s}s"
+
+    _broadcast("eta", {
+        "remaining": dur,
+        "finish": _progress["eta_finish"],
+        "done": done,
+        "total": total,
+        "avg": round(avg_per_sub, 2),
+    })
 
 
 def _prepare_one_stream(stream, tmp_dir, label, si):
@@ -153,11 +200,15 @@ class _StopRequested(Exception):
     pass
 
 
+_eta_frame_counts: list[int] = []
+
+
 def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
     global _is_running, _stop_requested
     _is_running = True
     _stop_requested = False
     _reset_progress()
+    _eta_frame_counts.clear()
 
     try:
         root = Path(config.input_path)
@@ -281,6 +332,15 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
                         "phase": f"{len(frames)} frames ready, starting OCR...",
                     })
 
+                    # Track frame counts for ETA estimation
+                    _eta_frame_counts.append(len(frames))
+                    avg_frames = sum(_eta_frame_counts) / len(_eta_frame_counts)
+                    remaining_streams = max(0, _progress["total_streams"] - _progress["done_streams"] - 1)
+                    _progress["total_subs_estimate"] = int(
+                        _progress["total_subs_done"] + len(frames) +
+                        remaining_streams * avg_frames
+                    )
+
                     _check_stop()
 
                     codec = "PGS" if stream.is_pgs else "VobSub"
@@ -300,6 +360,7 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
                     def on_progress(idx, result, _si=si, _total=len(frames)):
                         nonlocal completed
                         completed += 1
+                        _progress["total_subs_done"] += 1
                         txt = truncate(result.text, 80) if result.text else ""
                         _progress["current_completed"] = completed
                         _progress["current_text"] = txt
@@ -309,6 +370,9 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
                             "total": _total,
                             "text": txt,
                         })
+                        # Update ETA every 5 subtitles to avoid spamming
+                        if _progress["total_subs_done"] % 5 == 0 or completed == _total:
+                            _update_eta()
 
                     results = loop.run_until_complete(
                         ocr_client.ocr_frames(frames, stream.language, on_progress)
@@ -1113,6 +1177,23 @@ _HTML = r"""<!DOCTYPE html>
   .overall-progress .info .count { color: #888; }
   .overall-progress .progress-bar .fill { background: #4aff9e; }
 
+  /* ETA display */
+  .eta-display {
+    display: none;
+    margin-bottom: 1rem;
+    padding: 0.6rem 1rem;
+    background: #1a2a1a;
+    border: 1px solid #2a3a2a;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    color: #ccc;
+  }
+  .eta-display.visible { display: flex; align-items: center; gap: 0.6rem; }
+  .eta-remaining { color: #4aff9e; font-weight: 700; }
+  .eta-separator { color: #444; }
+  .eta-finish { color: #4a9eff; font-weight: 600; }
+  .eta-detail { color: #666; font-size: 0.8rem; margin-left: auto; font-family: 'SF Mono', Monaco, monospace; }
+
   /* Current progress bar */
   .current-progress { margin-bottom: 1rem; display: none; }
   .current-progress.visible { display: block; }
@@ -1351,6 +1432,12 @@ _HTML = r"""<!DOCTYPE html>
         <span class="count" id="opCount">0/0 streams</span>
       </div>
       <div class="progress-bar"><div class="fill" id="opFill"></div></div>
+    </div>
+    <div class="eta-display" id="etaDisplay">
+      <span class="eta-remaining" id="etaRemaining"></span>
+      <span class="eta-separator">-</span>
+      <span class="eta-finish" id="etaFinish"></span>
+      <span class="eta-detail" id="etaDetail"></span>
     </div>
     <div class="current-progress" id="currentProgress">
       <div class="info">
@@ -1838,6 +1925,15 @@ function startProcessing() {
     document.getElementById('cpText').textContent = d.text;
   });
 
+  eventSource.addEventListener('eta', e => {
+    const d = JSON.parse(e.data);
+    const eta = document.getElementById('etaDisplay');
+    eta.classList.add('visible');
+    document.getElementById('etaRemaining').textContent = d.remaining + ' remaining';
+    document.getElementById('etaFinish').textContent = 'until ' + d.finish;
+    document.getElementById('etaDetail').textContent = d.done + '/' + d.total + ' subs, ' + d.avg + 's/sub';
+  });
+
   eventSource.addEventListener('stream_done', e => {
     const d = JSON.parse(e.data);
     let msg = '  Done -> ' + d.output + ' (' + d.total_frames + ' frames)';
@@ -1869,6 +1965,7 @@ function startProcessing() {
     document.getElementById('btnStart').disabled = false;
     document.getElementById('btnStop').style.display = 'none';
     document.getElementById('currentProgress').classList.remove('visible');
+    document.getElementById('etaDisplay').classList.remove('visible');
     eventSource.close();
   });
 
@@ -1945,6 +2042,19 @@ fetch('/status').then(r => r.json()).then(data => {
     document.getElementById('opFill').style.width = pct + '%';
   }
 
+  // Restore ETA
+  if (p.eta_seconds > 0 && p.eta_finish) {
+    const eta = document.getElementById('etaDisplay');
+    eta.classList.add('visible');
+    const h = Math.floor(p.eta_seconds / 3600);
+    const m = Math.floor((p.eta_seconds % 3600) / 60);
+    const dur = h > 0 ? h + 'h ' + m + 'm' : m + 'm';
+    document.getElementById('etaRemaining').textContent = dur + ' remaining';
+    document.getElementById('etaFinish').textContent = 'until ' + p.eta_finish;
+    document.getElementById('etaDetail').textContent =
+      p.total_subs_done + '/' + p.total_subs_estimate + ' subs';
+  }
+
   // Restore current stream progress
   if (p.current_total > 0 && p.current_completed < p.current_total) {
     const cp = document.getElementById('currentProgress');
@@ -1976,6 +2086,15 @@ fetch('/status').then(r => r.json()).then(data => {
     document.getElementById('cpCount').textContent = d.completed + '/' + d.total;
     document.getElementById('cpFill').style.width = pct + '%';
     document.getElementById('cpText').textContent = d.text;
+  });
+
+  eventSource.addEventListener('eta', e => {
+    const d = JSON.parse(e.data);
+    const eta = document.getElementById('etaDisplay');
+    eta.classList.add('visible');
+    document.getElementById('etaRemaining').textContent = d.remaining + ' remaining';
+    document.getElementById('etaFinish').textContent = 'until ' + d.finish;
+    document.getElementById('etaDetail').textContent = d.done + '/' + d.total + ' subs, ' + d.avg + 's/sub';
   });
 
   eventSource.addEventListener('stream_ocr_start', e => {
@@ -2028,6 +2147,7 @@ fetch('/status').then(r => r.json()).then(data => {
     document.getElementById('btnStart').disabled = false;
     document.getElementById('btnStop').style.display = 'none';
     document.getElementById('currentProgress').classList.remove('visible');
+    document.getElementById('etaDisplay').classList.remove('visible');
     eventSource.close();
   });
 });
@@ -2045,7 +2165,10 @@ def main():
     # Auto-mount SMB share from env vars if configured
     _auto_mount_smb()
 
-    server = HTTPServer((bind, port), GUIHandler)
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+    server = ThreadedHTTPServer((bind, port), GUIHandler)
     url = f"http://127.0.0.1:{port}"
     print(f"Subtitler GUI running at {url}")
     if not os.environ.get("SUBTITLER_DOCKER"):
