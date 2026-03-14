@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .assembler import build_output_path, write_subtitles
 from .config import Config, load_config
 from .extractor import extract_stream
-from .ocr import OCRClient
+from .ocr import OCRClient, MultiOCRClient, ServerConfig
 from .probe import probe_subtitles
 from .progress import truncate
 from .scanner import scan_videos
@@ -153,7 +153,7 @@ class _StopRequested(Exception):
     pass
 
 
-def _run_pipeline(config: Config):
+def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
     global _is_running, _stop_requested
     _is_running = True
     _stop_requested = False
@@ -200,7 +200,23 @@ def _run_pipeline(config: Config):
             video_streams[stream.source_file].append((si, stream))
 
         loop = asyncio.new_event_loop()
-        ocr_client = OCRClient(config, stop_check=lambda: _stop_requested)
+        if servers:
+            def on_server_fail(name, error):
+                msg = f"Server '{name}' failed: {error}. Redistributing work to remaining servers."
+                _broadcast("status", {"message": msg})
+                _log(msg)
+
+            ocr_client = MultiOCRClient(
+                config, servers,
+                stop_check=lambda: _stop_requested,
+                on_server_fail=on_server_fail,
+            )
+            server_names = ", ".join(s.name for s in servers)
+            total_concurrency = sum(s.concurrency for s in servers)
+            _broadcast("status", {"message": f"Using {len(servers)} server(s): {server_names} (total concurrency: {total_concurrency})"})
+            _log(f"Using {len(servers)} server(s): {server_names}")
+        else:
+            ocr_client = OCRClient(config=config, stop_check=lambda: _stop_requested)
         any_work = False
 
         try:
@@ -452,16 +468,32 @@ class GUIHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
 
+            # Parse server configs from request
+            servers = None
+            raw_servers = body.get("servers")
+            if raw_servers and isinstance(raw_servers, list) and len(raw_servers) > 0:
+                servers = [
+                    ServerConfig(
+                        name=s.get("name", f"Server {i+1}"),
+                        base_url=s["base_url"],
+                        api_key=s.get("api_key", ""),
+                        model=s["model"],
+                        concurrency=int(s.get("concurrency", 4)),
+                    )
+                    for i, s in enumerate(raw_servers)
+                    if s.get("base_url") and s.get("model")
+                ]
+                if not servers:
+                    servers = None
+
             config = load_config(cli_overrides={
                 "input_path": unquote(body.get("folder", ".")).strip(),
                 "language": body.get("language") or None,
                 "forced_only": body.get("forced_only", False),
                 "output_format": body.get("output_format", "vtt"),
-                "model": body.get("model") or None,
-                "concurrency": body.get("concurrency") or None,
             })
 
-            thread = threading.Thread(target=_run_pipeline, args=(config,), daemon=True)
+            thread = threading.Thread(target=_run_pipeline, args=(config, servers), daemon=True)
             thread.start()
 
             self._json_response({"status": "started"})
@@ -571,18 +603,35 @@ class GUIHandler(BaseHTTPRequestHandler):
 
         folder = unquote(body.get("folder", ".")).strip()
         subs_per_file = int(body.get("subs_per_stream", 400))
-        concurrency = int(body.get("concurrency", 0)) or 10
+
+        # Parse servers for concurrency calculation
+        raw_servers = body.get("servers")
+        servers = []
+        if raw_servers and isinstance(raw_servers, list):
+            servers = [
+                ServerConfig(
+                    name=s.get("name", f"Server {i+1}"),
+                    base_url=s["base_url"],
+                    api_key=s.get("api_key", ""),
+                    model=s["model"],
+                    concurrency=int(s.get("concurrency", 4)),
+                )
+                for i, s in enumerate(raw_servers)
+                if s.get("base_url") and s.get("model")
+            ]
+        total_concurrency = sum(s.concurrency for s in servers) if servers else int(body.get("concurrency", 0)) or 10
 
         root = Path(folder)
         if not root.exists():
             self._json_response({"error": f"Path not found: {folder}"}, 400)
             return
 
+        # Use first server for benchmark if available
+        estimate_server = servers[0] if servers else None
         config = load_config(cli_overrides={
             "input_path": folder,
             "language": body.get("language") or None,
             "forced_only": body.get("forced_only", False),
-            "model": body.get("model") or None,
             "concurrency": 1,  # sequential for accurate timing
         })
 
@@ -627,9 +676,12 @@ class GUIHandler(BaseHTTPRequestHandler):
             sample_count = min(10, len(frames))
             samples = random.sample(frames, sample_count)
 
-            # Benchmark OCR
+            # Benchmark OCR (use first server if available, else config)
             loop = asyncio.new_event_loop()
-            ocr_client = OCRClient(config)
+            if estimate_server:
+                ocr_client = OCRClient(config=config, server=estimate_server)
+            else:
+                ocr_client = OCRClient(config=config)
             times = []
 
             try:
@@ -644,7 +696,7 @@ class GUIHandler(BaseHTTPRequestHandler):
             avg_time = sum(times) / len(times)
             total_subs = subs_per_file * total_streams
             # With concurrency, effective time = total / concurrency
-            effective_concurrency = min(concurrency, total_subs)
+            effective_concurrency = min(total_concurrency, total_subs)
             total_seconds = (avg_time * total_subs) / effective_concurrency
 
             hours = int(total_seconds // 3600)
@@ -665,7 +717,8 @@ class GUIHandler(BaseHTTPRequestHandler):
                 "total_streams": total_streams,
                 "subs_per_stream": subs_per_file,
                 "total_subs_estimate": total_subs,
-                "concurrency": concurrency,
+                "concurrency": total_concurrency,
+                "num_servers": len(servers) if servers else 1,
                 "total_time_estimate": time_str,
                 "total_seconds": round(total_seconds, 1),
                 "first_stream_actual_frames": len(frames),
@@ -875,6 +928,97 @@ _HTML = r"""<!DOCTYPE html>
   .btn-estimate { background: #2a2a3a; color: #aac; }
   .btn-estimate:hover { background: #3a3a4a; }
   .btn-estimate:disabled { background: #222; color: #555; cursor: not-allowed; }
+
+  /* Servers panel */
+  .servers-panel {
+    background: #1a1a1a;
+    border: 1px solid #222;
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  .servers-panel h3 {
+    font-size: 0.95rem;
+    color: #ccc;
+    margin-bottom: 1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .server-list { display: flex; flex-direction: column; gap: 0.8rem; }
+  .server-item {
+    background: #0f0f0f;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 1rem;
+  }
+  .server-item.disabled { opacity: 0.5; }
+  .server-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.8rem;
+  }
+  .server-header .server-name {
+    font-weight: 600;
+    color: #e0e0e0;
+    font-size: 0.95rem;
+  }
+  .server-header .server-actions {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+  }
+  .server-fields {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem;
+  }
+  .server-fields .full { grid-column: span 2; }
+  .server-fields label {
+    display: block;
+    font-size: 0.7rem;
+    color: #666;
+    margin-bottom: 0.2rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .server-fields input {
+    width: 100%;
+    padding: 0.5rem 0.7rem;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 5px;
+    color: #e0e0e0;
+    font-size: 0.85rem;
+  }
+  .server-fields input:focus { outline: none; border-color: #4a9eff; }
+  .server-fields input::placeholder { color: #444; }
+  .btn-add-server {
+    background: #2a3a2a;
+    color: #afc;
+    border: none;
+    padding: 0.4rem 1rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .btn-add-server:hover { background: #3a4a3a; }
+  .btn-remove-server {
+    background: #3a2020;
+    color: #ff6666;
+    border: none;
+    padding: 0.25rem 0.6rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+  }
+  .btn-remove-server:hover { background: #4a2020; }
+  .server-toggle {
+    width: 16px;
+    height: 16px;
+    accent-color: #4a9eff;
+  }
 
   /* Estimate panel */
   .estimate-panel {
@@ -1154,20 +1298,21 @@ _HTML = r"""<!DOCTYPE html>
         <option value="srt">SRT</option>
       </select>
     </div>
-    <div class="option">
-      <label>Model</label>
-      <input type="text" id="optModel" placeholder="from config" />
-    </div>
-    <div class="option">
-      <label>Concurrency</label>
-      <input type="number" id="optConcurrency" placeholder="10" min="1" max="50" />
-    </div>
     <div class="option checkbox-option" style="grid-column: span 2;">
       <input type="checkbox" id="optForced" />
       <label style="margin: 0; text-transform: none; font-size: 0.95rem; color: #ccc;">
         Forced subtitles only
       </label>
     </div>
+  </div>
+
+  <!-- Servers Panel -->
+  <div class="servers-panel">
+    <h3>
+      <span>API Servers</span>
+      <button class="btn-add-server" onclick="addServer()">+ Add Server</button>
+    </h3>
+    <div class="server-list" id="serverList"></div>
   </div>
 
   <!-- Time Estimate -->
@@ -1243,6 +1388,115 @@ _HTML = r"""<!DOCTYPE html>
 let eventSource = null;
 let scannedFolder = null;
 let currentBrowsePath = '/';
+
+/* --- Servers --- */
+
+function getServers() {
+  try {
+    return JSON.parse(localStorage.getItem('subtitler_servers') || '[]');
+  } catch { return []; }
+}
+
+function saveServers(servers) {
+  localStorage.setItem('subtitler_servers', JSON.stringify(servers));
+}
+
+function getEnabledServers() {
+  return getServers().filter(s => s.enabled !== false);
+}
+
+function getTotalConcurrency() {
+  const enabled = getEnabledServers();
+  if (!enabled.length) return 10;
+  return enabled.reduce((sum, s) => sum + (parseInt(s.concurrency) || 4), 0);
+}
+
+function renderServers() {
+  const servers = getServers();
+  const container = document.getElementById('serverList');
+
+  if (!servers.length) {
+    container.innerHTML = '<div style="color:#555;font-size:0.85rem;padding:0.5rem 0;">No servers configured. Add a server to get started.</div>';
+    return;
+  }
+
+  container.innerHTML = servers.map((s, i) =>
+    '<div class="server-item' + (s.enabled === false ? ' disabled' : '') + '" data-idx="' + i + '">' +
+      '<div class="server-header">' +
+        '<span class="server-name">' + escHtml(s.name || 'Server ' + (i+1)) + '</span>' +
+        '<span class="server-actions">' +
+          '<input type="checkbox" class="server-toggle" ' + (s.enabled !== false ? 'checked' : '') +
+          ' onchange="toggleServer(' + i + ', this.checked)" title="Enable/disable" />' +
+          '<button class="btn-remove-server" onclick="removeServer(' + i + ')">Remove</button>' +
+        '</span>' +
+      '</div>' +
+      '<div class="server-fields">' +
+        '<div class="full"><label>Base URL</label>' +
+          '<input type="text" value="' + escAttr(s.base_url || '') + '" ' +
+          'placeholder="https://openrouter.ai/api/v1" onchange="updateServer(' + i + ',\'base_url\',this.value)" /></div>' +
+        '<div class="full"><label>API Key</label>' +
+          '<input type="password" value="' + escAttr(s.api_key || '') + '" ' +
+          'placeholder="sk-..." onchange="updateServer(' + i + ',\'api_key\',this.value)" /></div>' +
+        '<div><label>Model</label>' +
+          '<input type="text" value="' + escAttr(s.model || '') + '" ' +
+          'placeholder="google/gemma-3-27b-it" onchange="updateServer(' + i + ',\'model\',this.value)" /></div>' +
+        '<div><label>Concurrency</label>' +
+          '<input type="number" value="' + (s.concurrency || 4) + '" min="1" max="50" ' +
+          'onchange="updateServer(' + i + ',\'concurrency\',parseInt(this.value)||4)" /></div>' +
+      '</div>' +
+    '</div>'
+  ).join('');
+}
+
+function addServer() {
+  const servers = getServers();
+  servers.push({
+    name: 'Server ' + (servers.length + 1),
+    base_url: '',
+    api_key: '',
+    model: '',
+    concurrency: 4,
+    enabled: true,
+  });
+  saveServers(servers);
+  renderServers();
+}
+
+function removeServer(idx) {
+  const servers = getServers();
+  servers.splice(idx, 1);
+  saveServers(servers);
+  renderServers();
+}
+
+function updateServer(idx, field, value) {
+  const servers = getServers();
+  if (servers[idx]) {
+    servers[idx][field] = value;
+    // Auto-update name from URL if name is default
+    if (field === 'base_url' && servers[idx].name.startsWith('Server ')) {
+      try {
+        const host = new URL(value).hostname;
+        if (host) servers[idx].name = host;
+      } catch {}
+    }
+    saveServers(servers);
+    if (field === 'base_url') renderServers();
+  }
+}
+
+function toggleServer(idx, enabled) {
+  const servers = getServers();
+  if (servers[idx]) {
+    servers[idx].enabled = enabled;
+    saveServers(servers);
+    renderServers();
+  }
+}
+
+function escAttr(s) {
+  return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 
 /* --- SMB --- */
 
@@ -1480,19 +1734,19 @@ function runEstimate() {
   result.classList.remove('visible');
 
   const subsPerFile = parseInt(document.getElementById('estSubsPerFile').value) || 400;
-  const concurrency = parseInt(document.getElementById('optConcurrency').value) || 10;
   const langSelect = document.getElementById('optLanguage');
   const language = Array.from(langSelect.selectedOptions).map(o => o.value);
-  const model = document.getElementById('optModel').value.trim() || undefined;
   const forcedOnly = document.getElementById('optForced').checked;
+  const enabledServers = getEnabledServers();
 
   fetch('/estimate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
-      folder, subs_per_stream: subsPerFile, concurrency,
+      folder, subs_per_stream: subsPerFile,
+      servers: enabledServers.length ? enabledServers : undefined,
       language: language.length ? language : null,
-      model, forced_only: forcedOnly
+      forced_only: forcedOnly
     })
   })
   .then(r => r.json())
@@ -1512,7 +1766,7 @@ function runEstimate() {
       'First stream actual frames: ' + data.first_stream_actual_frames + '<br>' +
       'Estimate: ' + data.total_streams + ' streams x ' + data.subs_per_stream +
       ' subs = ' + data.total_subs_estimate + ' total<br>' +
-      'Concurrency: ' + data.concurrency + '<br>' +
+      'Servers: ' + data.num_servers + ', Total concurrency: ' + data.concurrency + '<br>' +
       'Sample times: ' + data.sample_times.join('s, ') + 's';
     result.classList.add('visible');
   })
@@ -1618,6 +1872,8 @@ function startProcessing() {
     eventSource.close();
   });
 
+  const enabledServers = getEnabledServers();
+
   fetch('/start', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1626,8 +1882,7 @@ function startProcessing() {
       language: Array.from(document.getElementById('optLanguage').selectedOptions).map(o => o.value),
       forced_only: document.getElementById('optForced').checked,
       output_format: document.getElementById('optFormat').value,
-      model: document.getElementById('optModel').value || null,
-      concurrency: parseInt(document.getElementById('optConcurrency').value) || null,
+      servers: enabledServers.length ? enabledServers : undefined,
     })
   });
 }
@@ -1658,8 +1913,9 @@ document.getElementById('folderPath').addEventListener('keydown', e => {
   if (e.key === 'Enter') scanFolder();
 });
 
-// Load mounts on startup
+// Load mounts and servers on startup
 refreshMounts();
+renderServers();
 
 // Check for running job on page load
 fetch('/status').then(r => r.json()).then(data => {
