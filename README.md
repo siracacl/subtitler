@@ -20,20 +20,45 @@ Works with any OpenAI-compatible API: OpenRouter, LM Studio, Ollama, or your own
 
 ## Quick Start (Docker)
 
+### Pre-built image (recommended)
+
 ```bash
-# 1. Clone the repo
-git clone https://github.com/yourusername/subtitler.git
-cd subtitler
+# 1. Create a docker-compose.yml
+cat > docker-compose.yml <<'EOF'
+services:
+  subtitler:
+    image: ghcr.io/yourusername/subtitler:latest
+    ports:
+      - "8642:8642"
+    privileged: true
+    env_file: stack.env
+    volumes:
+      - /path/to/your/videos:/videos
+EOF
 
 # 2. Create your config
-cp stack.env.example stack.env
-# Edit stack.env and set SUBTITLER_API_KEY
+cat > stack.env <<'EOF'
+PYTHONUNBUFFERED=1
+# Optional - servers can be configured in the web UI instead
+# SUBTITLER_API_KEY=sk-or-v1-your-key-here
+EOF
 
 # 3. Run
-docker compose up --build
+docker compose up -d
 ```
 
 Open `http://localhost:8642` in your browser.
+
+### Build from source
+
+```bash
+git clone https://github.com/yourusername/subtitler.git
+cd subtitler
+cp stack.env.example stack.env
+docker compose up --build
+```
+
+The image is automatically built for `linux/amd64` and `linux/arm64` on every push to main, tagged as `latest` and `YYYYMMDDHHMM`.
 
 ## Setup
 
