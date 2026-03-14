@@ -6,6 +6,20 @@ OCR image-based subtitles (PGS/VobSub) from video files using vision LLMs. Extra
 
 Works with any OpenAI-compatible API: OpenRouter, LM Studio, Ollama, or your own endpoint.
 
+## Why this exists
+
+[Subtitle Edit](https://github.com/SubtitleEdit/subtitleedit) is an excellent tool for working with subtitles - including OCR of image-based formats. However, if you have a large media library with hundreds of video files across multiple seasons and languages, processing them one by one through a desktop GUI is not practical.
+
+Subtitler was built to fill that gap: a batch-capable, headless-friendly tool that can chew through an entire library unattended. Point it at a folder (or a network share), configure your API servers, hit start, and come back hours later to a complete set of text subtitles. It leverages modern vision LLMs instead of traditional OCR engines like Tesseract, which tend to perform significantly better on the varied fonts, colors, and backgrounds found in subtitle images - especially across multiple languages.
+
+The VobSub parser is a direct port of Subtitle Edit's own decoder, so credit where credit is due.
+
+## Security and safety notes
+
+- **No authentication**: The web GUI has no login or access control. Do not expose it to the public internet - run it only on trusted internal networks or behind a reverse proxy with authentication.
+- **Privileged container**: The Docker container runs in `privileged` mode to support SMB share mounting. This gives the container full access to the host system. If you don't need network shares, remove `privileged: true` from your `docker-compose.yml`.
+- **Backup your files**: While subtitler has been thoroughly tested on hundreds of files without issues, it works with ffmpeg to extract streams from your video files. It is designed to leave your original files just that, original (i.e. nothing is written or changed). However, the possibility of something going wrong - however unlikely - cannot be entirely ruled out. A solid backup strategy for your media library is always recommended before batch-processing large collections.
+
 ## Features
 
 - **PGS & VobSub** parsing with zero external subtitle libraries (pure Python binary decoders)
@@ -171,7 +185,7 @@ The GUI runs at `http://localhost:8642` and provides:
 
 ### Multi-server setup
 
-You can configure multiple API servers in the GUI to distribute OCR work. Each server has its own base URL, API key, model, and concurrency limit. The application distributes frames round-robin across all enabled servers.
+You can configure multiple API servers in the GUI to distribute OCR work. Each server has its own base URL, API key, model, and concurrency limit. The application distributes frames evenly across all enabled servers, which process them concurrently.
 
 Example use case: run a local LM Studio instance (concurrency 3) alongside OpenRouter (concurrency 20) for a combined throughput of 23 concurrent requests.
 
@@ -239,20 +253,23 @@ MKV, MP4, AVI, M4V, TS, M2TS, VOB, MPG, MPEG, WMV, OGM, MOV
 
 ## Recommended models
 
+**Personal recommendation: `qwen/qwen2.5-vl-7b`** - Fast, accurate, and small enough to run locally on an M4 Mac Mini at ~22 tokens/s. In testing, it produced better OCR results than the larger Gemma 3 27B model, particularly with accented characters and multilingual text. It's the best balance of speed, accuracy, and resource usage for subtitle OCR. In general, I'd recommend to turn off thinking/reasoning (where applicable) - in my testing this lead to "corrected" subtitles, i.e. the LLM sometimes not returning text true to the original.
+
 | Model | Best for | Notes |
 |---|---|---|
-| Gemma 3 27B | Cloud (OpenRouter) | Good multilingual OCR, cheap |
-| Qwen 2.5 VL 7B/32B | Local (LM Studio) | Strong OCR benchmarks |
-| Qwen 3.5 9B | Local (LM Studio) | Fast, thinking mode should be disabled |
+| **Qwen 2.5 VL 7B** | **Local (LM Studio)** | **Best accuracy, runs on 16GB Macs** |
+| Qwen 2.5 VL 32B | Local (LM Studio) | Needs 24GB+, slightly better on edge cases |
+| Gemma 3 27B | Cloud (OpenRouter) | Good and cheap via API, less accurate than Qwen 2.5 VL locally |
+| Qwen 3.5 9B | Local (LM Studio) | Fast but thinking mode should be disabled |
 
 For local models on Apple Silicon, see the memory requirements:
 
-| Model | Quantization | VRAM needed |
-|---|---|---|
-| Qwen 2.5 VL 7B | Q4_K_M | ~5 GB |
-| Qwen 3.5 9B | Q4_K_M | ~6 GB |
-| Gemma 3 27B | Q4_K_M | ~18 GB |
-| Gemma 3 27B | Q6_K | ~23 GB |
+| Model | Quantization | VRAM needed | ~tok/s (M4 Mini) |
+|---|---|---|---|
+| Qwen 2.5 VL 7B | Q4_K_M | ~5 GB | ~22 |
+| Qwen 3.5 9B | Q4_K_M | ~6 GB | ~14 |
+| Gemma 3 27B | Q4_K_M | ~18 GB | Won't fit (16GB) |
+| Gemma 3 27B | Q6_K | ~23 GB | Won't fit (16GB) |
 
 ## Project structure
 
