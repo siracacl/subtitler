@@ -242,6 +242,12 @@ def parse_pgs(sup_path: Path) -> list[SubtitleFrame]:
 
         img = _decode_rle(ds.obj, ds.palette)
 
+        # Skip blank/transparent frames (clear screen commands)
+        alpha_data = img.getchannel("A")
+        if alpha_data.getextrema()[1] < 10:
+            # Max alpha under 10 means effectively invisible
+            continue
+
         # Find end time
         end_ms = ds.pts + 5000
         for j in range(i + 1, len(display_sets)):
