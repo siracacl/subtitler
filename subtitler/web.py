@@ -105,7 +105,6 @@ _progress = {
     "total_subs_done": 0,
     "total_subs_estimate": 0,  # estimated total across all streams
     "eta_seconds": 0,
-    "eta_finish": "",
 }
 
 
@@ -134,7 +133,6 @@ def _reset_progress():
     _progress["total_subs_done"] = 0
     _progress["total_subs_estimate"] = 0
     _progress["eta_seconds"] = 0
-    _progress["eta_finish"] = ""
 
 
 def _update_eta():
@@ -149,24 +147,8 @@ def _update_eta():
     eta_seconds = avg_per_sub * remaining
     _progress["eta_seconds"] = eta_seconds
 
-    from datetime import datetime, timedelta
-    finish_time = datetime.now() + timedelta(seconds=eta_seconds)
-    _progress["eta_finish"] = finish_time.strftime("%H:%M")
-
-    # Format duration
-    h = int(eta_seconds // 3600)
-    m = int((eta_seconds % 3600) // 60)
-    s = int(eta_seconds % 60)
-    if h > 0:
-        dur = f"{h}h {m}m"
-    elif m > 0:
-        dur = f"{m}m {s}s"
-    else:
-        dur = f"{s}s"
-
     _broadcast("eta", {
-        "remaining": dur,
-        "finish": _progress["eta_finish"],
+        "eta_seconds": eta_seconds,
         "done": done,
         "total": total,
         "avg": round(avg_per_sub, 2),
@@ -1928,11 +1910,7 @@ function startProcessing() {
 
   eventSource.addEventListener('eta', e => {
     const d = JSON.parse(e.data);
-    const eta = document.getElementById('etaDisplay');
-    eta.classList.add('visible');
-    document.getElementById('etaRemaining').textContent = d.remaining + ' remaining';
-    document.getElementById('etaFinish').textContent = 'until ' + d.finish;
-    document.getElementById('etaDetail').textContent = d.done + '/' + d.total + ' subs, ' + d.avg + 's/sub';
+    showEta(d.eta_seconds, d.done, d.total, d.avg);
   });
 
   eventSource.addEventListener('stream_done', e => {
@@ -1998,6 +1976,28 @@ function clearLog() {
   document.getElementById('currentProgress').classList.remove('visible');
 }
 
+function showEta(etaSeconds, done, total, avg) {
+  const el = document.getElementById('etaDisplay');
+  el.classList.add('visible');
+  // Format remaining duration
+  const h = Math.floor(etaSeconds / 3600);
+  const m = Math.floor((etaSeconds % 3600) / 60);
+  const s = Math.floor(etaSeconds % 60);
+  let dur;
+  if (h > 0) dur = h + 'h ' + m + 'm';
+  else if (m > 0) dur = m + 'm ' + s + 's';
+  else dur = s + 's';
+  document.getElementById('etaRemaining').textContent = dur + ' remaining';
+  // Format finish date/time in user's local timezone
+  const finish = new Date(Date.now() + etaSeconds * 1000);
+  const opts = { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+  document.getElementById('etaFinish').textContent = 'until ' + finish.toLocaleString(undefined, opts);
+  // Detail line
+  let detail = done + '/' + total + ' subs';
+  if (avg !== undefined) detail += ', ' + avg + 's/sub';
+  document.getElementById('etaDetail').textContent = detail;
+}
+
 function addLog(text, cls) {
   const log = document.getElementById('log');
   const div = document.createElement('div');
@@ -2044,16 +2044,8 @@ fetch('/status').then(r => r.json()).then(data => {
   }
 
   // Restore ETA
-  if (p.eta_seconds > 0 && p.eta_finish) {
-    const eta = document.getElementById('etaDisplay');
-    eta.classList.add('visible');
-    const h = Math.floor(p.eta_seconds / 3600);
-    const m = Math.floor((p.eta_seconds % 3600) / 60);
-    const dur = h > 0 ? h + 'h ' + m + 'm' : m + 'm';
-    document.getElementById('etaRemaining').textContent = dur + ' remaining';
-    document.getElementById('etaFinish').textContent = 'until ' + p.eta_finish;
-    document.getElementById('etaDetail').textContent =
-      p.total_subs_done + '/' + p.total_subs_estimate + ' subs';
+  if (p.eta_seconds > 0) {
+    showEta(p.eta_seconds, p.total_subs_done, p.total_subs_estimate);
   }
 
   // Restore current stream progress
@@ -2091,11 +2083,7 @@ fetch('/status').then(r => r.json()).then(data => {
 
   eventSource.addEventListener('eta', e => {
     const d = JSON.parse(e.data);
-    const eta = document.getElementById('etaDisplay');
-    eta.classList.add('visible');
-    document.getElementById('etaRemaining').textContent = d.remaining + ' remaining';
-    document.getElementById('etaFinish').textContent = 'until ' + d.finish;
-    document.getElementById('etaDetail').textContent = d.done + '/' + d.total + ' subs, ' + d.avg + 's/sub';
+    showEta(d.eta_seconds, d.done, d.total, d.avg);
   });
 
   eventSource.addEventListener('stream_ocr_start', e => {
