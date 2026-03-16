@@ -160,12 +160,18 @@ def _decode_rle(obj: PgsObject, palette: PgsPalette) -> Image.Image:
                 # End of line
                 x = 0
                 y += 1
+            elif flag < 0x40:
+                # Short run of transparent pixels, length = flag (0x01-0x3F)
+                x += flag
             elif (flag & 0xC0) == 0x40:
-                # Run of color 0 (transparent), length in lower 6 bits
-                run_len = flag & 0x3F
+                # Long run of transparent pixels, 14-bit length
+                if pos >= len(data):
+                    break
+                run_len = ((flag & 0x3F) << 8) | data[pos]
+                pos += 1
                 x += run_len
             elif (flag & 0xC0) == 0x80:
-                # Run of color, length in lower 6 bits
+                # Short run of color, length in lower 6 bits
                 if pos >= len(data):
                     break
                 run_len = flag & 0x3F
@@ -177,7 +183,7 @@ def _decode_rle(obj: PgsObject, palette: PgsPalette) -> Image.Image:
                         pixels[x, y] = color
                     x += 1
             elif (flag & 0xC0) == 0xC0:
-                # Long run of color, length in 14 bits
+                # Long run of color, 14-bit length
                 if pos >= len(data):
                     break
                 run_len = ((flag & 0x3F) << 8) | data[pos]
@@ -191,13 +197,6 @@ def _decode_rle(obj: PgsObject, palette: PgsPalette) -> Image.Image:
                     if x < obj.width and y < obj.height:
                         pixels[x, y] = color
                     x += 1
-            else:
-                # Long run of color 0 (transparent), length in 14 bits
-                run_len = ((flag & 0x3F) << 8)
-                if pos < len(data):
-                    run_len |= data[pos]
-                    pos += 1
-                x += run_len
 
     return img
 
