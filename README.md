@@ -185,7 +185,7 @@ The GUI runs at `http://localhost:8642` and provides:
 
 ### Multi-server setup
 
-You can configure multiple API servers in the GUI to distribute OCR work. Each server has its own base URL, API key, model, and concurrency limit. The application distributes frames evenly across all enabled servers, which process them concurrently.
+You can configure multiple API servers in the GUI to distribute OCR work. Each server has its own base URL, API key, model, and concurrency limit. All servers pull from a shared work queue concurrently - faster servers naturally take on more work, so you get optimal throughput regardless of speed differences between servers.
 
 Example use case: run a local LM Studio instance (concurrency 3) alongside OpenRouter (concurrency 20) for a combined throughput of 23 concurrent requests.
 

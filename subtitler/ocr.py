@@ -200,39 +200,46 @@ class MultiOCRClient:
         language: str | None,
         on_progress=None,
     ) -> list[OCRResult]:
-        """Distribute frames across all servers. Each server's semaphore limits its own concurrency.
-        If a server becomes unreachable, its frames are retried on remaining servers."""
+        """Distribute frames across all servers using a shared work queue.
+        Faster servers naturally take more work. If a server becomes unreachable,
+        its frames are retried on remaining servers."""
         results: list[OCRResult | None] = [None] * len(frames)
+        queue: asyncio.Queue[tuple[int, SubtitleFrame]] = asyncio.Queue()
+        for i, f in enumerate(frames):
+            queue.put_nowait((i, f))
 
-        async def process(idx: int, frame: SubtitleFrame):
-            active = self._active_clients()
-            if not active:
-                result = OCRResult(frame=frame, text="[OCR ERROR: all servers failed]")
+        async def worker(client_idx: int, client: OCRClient):
+            """Each worker pulls frames from the shared queue until empty."""
+            while not queue.empty():
+                if self.stop_check and self.stop_check():
+                    return
+                try:
+                    idx, frame = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+                result = await client.ocr_frame(frame, language)
+
+                # Connection error - mark server failed, re-queue frame for others
+                if result.text.startswith("[OCR ERROR:") and ("ConnectError" in result.text or
+                        "ConnectTimeout" in result.text or "ConnectionRefused" in result.text):
+                    await self._mark_failed(client_idx, result.text)
+                    queue.put_nowait((idx, frame))
+                    return  # This worker stops, remaining workers pick up the frame
+
                 results[idx] = result
                 if on_progress:
                     on_progress(idx, result)
-                return
 
-            # Distribute evenly across active clients
-            client_idx, client = active[idx % len(active)]
-            result = await client.ocr_frame(frame, language)
+        # Launch workers per server matching each server's concurrency
+        active = self._active_clients()
+        if not active:
+            return [OCRResult(frame=f, text="[OCR ERROR: all servers failed]") for f in frames]
 
-            # Check if this was a connection error - retry on another server
-            if result.text.startswith("[OCR ERROR:") and ("ConnectError" in result.text or
-                    "ConnectTimeout" in result.text or "ConnectionRefused" in result.text):
-                await self._mark_failed(client_idx, result.text)
-
-                # Retry on remaining servers
-                remaining = self._active_clients()
-                if remaining:
-                    fallback_idx, fallback = remaining[idx % len(remaining)]
-                    result = await fallback.ocr_frame(frame, language)
-
-            results[idx] = result
-            if on_progress:
-                on_progress(idx, result)
-
-        tasks = [asyncio.ensure_future(process(i, f)) for i, f in enumerate(frames)]
+        tasks = []
+        for ci, c in active:
+            for _ in range(c.semaphore._value):
+                tasks.append(asyncio.ensure_future(worker(ci, c)))
 
         # Poll for completion, cancel remaining on stop
         while tasks:
