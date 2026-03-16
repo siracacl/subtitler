@@ -51,6 +51,7 @@ class OCRClient:
             self.base_url = server.base_url
             self.model = server.model
             self.prompt = config.prompt if config else "Read the subtitle text in this image. The language is {language}. Return ONLY the subtitle text, nothing else. Preserve line breaks exactly as shown."
+            self.concurrency = server.concurrency
             self.semaphore = asyncio.Semaphore(server.concurrency)
             self.server_name = server.name
             headers = {"Content-Type": "application/json"}
@@ -61,6 +62,7 @@ class OCRClient:
             self.base_url = config.base_url
             self.model = config.model
             self.prompt = config.prompt
+            self.concurrency = config.concurrency
             self.semaphore = asyncio.Semaphore(config.concurrency)
             self.server_name = "default"
             headers = {"Content-Type": "application/json"}
@@ -204,19 +206,24 @@ class MultiOCRClient:
         Faster servers naturally take more work. If a server becomes unreachable,
         its frames are retried on remaining servers."""
         results: list[OCRResult | None] = [None] * len(frames)
-        queue: asyncio.Queue[tuple[int, SubtitleFrame]] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[int, SubtitleFrame] | None] = asyncio.Queue()
         for i, f in enumerate(frames):
             queue.put_nowait((i, f))
 
+        active = self._active_clients()
+        if not active:
+            return [OCRResult(frame=f, text="[OCR ERROR: all servers failed]") for f in frames]
+
         async def worker(client_idx: int, client: OCRClient):
-            """Each worker pulls frames from the shared queue until empty."""
-            while not queue.empty():
+            """Each worker pulls one frame at a time from the shared queue."""
+            while True:
                 if self.stop_check and self.stop_check():
                     return
-                try:
-                    idx, frame = queue.get_nowait()
-                except asyncio.QueueEmpty:
+                item = await queue.get()
+                if item is None:
+                    queue.put_nowait(None)  # Re-post sentinel for other workers
                     return
+                idx, frame = item
 
                 result = await client.ocr_frame(frame, language)
 
@@ -225,21 +232,22 @@ class MultiOCRClient:
                         "ConnectTimeout" in result.text or "ConnectionRefused" in result.text):
                     await self._mark_failed(client_idx, result.text)
                     queue.put_nowait((idx, frame))
-                    return  # This worker stops, remaining workers pick up the frame
+                    return  # This worker stops, others pick up the frame
 
                 results[idx] = result
                 if on_progress:
                     on_progress(idx, result)
 
-        # Launch workers per server matching each server's concurrency
-        active = self._active_clients()
-        if not active:
-            return [OCRResult(frame=f, text="[OCR ERROR: all servers failed]") for f in frames]
-
+        # Spawn one worker per concurrency slot per server
+        # Each worker processes frames sequentially; concurrency comes from
+        # having multiple workers per server pulling from the same queue
         tasks = []
         for ci, c in active:
-            for _ in range(c.semaphore._value):
+            for _ in range(c.concurrency):
                 tasks.append(asyncio.ensure_future(worker(ci, c)))
+
+        # Post sentinel after all real work is queued - workers exit when they see it
+        queue.put_nowait(None)
 
         # Poll for completion, cancel remaining on stop
         while tasks:
