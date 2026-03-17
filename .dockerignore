@@ -7,3 +7,4 @@ subtitler.yaml
 subtitler.yml
 *.vtt
 *.srt
+sonar-project.properties
