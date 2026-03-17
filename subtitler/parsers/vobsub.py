@@ -376,7 +376,7 @@ def _scan_all_pes_packets(data: bytes) -> list[tuple[int, bytes]]:
 # ---------------------------------------------------------------------------
 
 def _parse_idx_palette(idx_text: str) -> list[tuple[int, int, int]]:
-    match = re.search(r"^palette:\s*(.+)$", idx_text, re.MULTILINE)
+    match = re.search(r"^palette:\s*([^\n]+)", idx_text, re.MULTILINE)
     if not match:
         return [(i * 17, i * 17, i * 17) for i in range(16)]
     colors = []

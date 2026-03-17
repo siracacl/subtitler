@@ -1,3 +1,4 @@
+# Root required for mount.cifs (SMB auto-mount feature)
 FROM python:3.11-slim
 
 # Install ffmpeg and CIFS/SMB utilities
