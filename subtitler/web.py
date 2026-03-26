@@ -261,10 +261,12 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
 
                 # Build work items for this video (skip existing)
                 work_items = []
+                used_paths: set[Path] = set()
                 for si, stream in streams:
                     codec = "PGS" if stream.is_pgs else "VobSub"
                     label = f"{stream.source_file.stem} [{codec} {stream.lang_code}]"
-                    out_path = build_output_path(stream, config.output_format, config.output_dir)
+                    out_path = build_output_path(stream, config.output_format, config.output_dir, used_paths)
+                    used_paths.add(out_path)
 
                     if out_path.exists():
                         _broadcast("stream_skip", {
