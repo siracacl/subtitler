@@ -126,8 +126,12 @@ async def run(config: Config) -> None:
     tmp_dirs = []
     prepared: list[PreparedStream] = []
 
+    # Track used output paths per source file to avoid collisions (e.g. two eng tracks)
+    used_paths: dict[Path, set[Path]] = {}
     for stream in all_streams:
-        out_path = build_output_path(stream, config.output_format, config.output_dir)
+        per_file = used_paths.setdefault(stream.source_file, set())
+        out_path = build_output_path(stream, config.output_format, config.output_dir, per_file)
+        per_file.add(out_path)
         if out_path.exists():
             console.print(f"  [dim]Skipping {out_path.name} (already exists)[/dim]")
             continue

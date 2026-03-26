@@ -27,6 +27,7 @@ def build_output_path(
     stream: SubtitleStream,
     output_format: str,
     output_dir: str | None = None,
+    existing_paths: set[Path] | None = None,
 ) -> Path:
     video = stream.source_file
     stem = video.stem
@@ -37,9 +38,18 @@ def build_output_path(
         suffix += ".forced"
     suffix += f".{output_format}"
 
-    if output_dir:
-        return Path(output_dir) / (stem + suffix)
-    return video.parent / (stem + suffix)
+    base = Path(output_dir) if output_dir else video.parent
+    path = base / (stem + suffix)
+
+    # If this path is already taken by another stream, append the stream index
+    if existing_paths is not None and path in existing_paths:
+        suffix = f".{lang}"
+        if stream.forced:
+            suffix += ".forced"
+        suffix += f".{stream.index}.{output_format}"
+        path = base / (stem + suffix)
+
+    return path
 
 
 def write_subtitles(
