@@ -668,7 +668,10 @@ class GUIHandler(BaseHTTPRequestHandler):
                 for i, s in enumerate(raw_servers)
                 if s.get("base_url") and s.get("model")
             ]
-        total_concurrency = sum(s.concurrency for s in servers) if servers else int(body.get("concurrency", 0)) or 10
+        if servers:
+            total_concurrency = sum(s.concurrency for s in servers)
+        else:
+            total_concurrency = int(body.get("concurrency", 0)) or load_config().concurrency
 
         root = Path(folder)
         if not root.exists():
