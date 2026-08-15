@@ -36,11 +36,13 @@ def _language_name(code: str | None) -> str:
 
 
 def _strip_thinking(text: str) -> str:
-    """Remove <think>...</think> reasoning blocks some models emit inline.
-    An unclosed <think> means the answer was truncated mid-reasoning — nothing
-    usable follows it."""
+    """Remove model-specific wrappers from OCR output: <think> reasoning
+    blocks (an unclosed one means the answer was truncated mid-reasoning —
+    nothing usable follows it) and special-token markers like GLM's
+    <|begin_of_box|>. Subtitle text never legitimately contains either."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    return re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    return re.sub(r"<\|[^|>]{1,40}\|>", "", text)
 
 
 @dataclass
