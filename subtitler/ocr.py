@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import re
 import time
 from dataclasses import dataclass
 
@@ -32,6 +33,14 @@ def _language_name(code: str | None) -> str:
     if not code:
         return "Unknown"
     return LANG_NAMES.get(code, code)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks some models emit inline.
+    An unclosed <think> means the answer was truncated mid-reasoning — nothing
+    usable follows it."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return re.sub(r"<think>.*", "", text, flags=re.DOTALL)
 
 
 @dataclass
@@ -106,6 +115,9 @@ class OCRClient:
                 "max_tokens": 1000,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
+            if "minimax" in self.model.lower():
+                # MiniMax-M3 turn off thinking
+                payload["thinking"] = {"type": "disabled"}
 
             url = f"{self.base_url.rstrip('/')}/chat/completions"
 
@@ -119,7 +131,7 @@ class OCRClient:
                     resp.raise_for_status()
                     data = resp.json()
                     content = data["choices"][0]["message"]["content"]
-                    text = content.strip() if content else ""
+                    text = _strip_thinking(content).strip() if content else ""
                     return OCRResult(frame=frame, text=text)
                 except (httpx.HTTPStatusError, httpx.ReadTimeout, json.JSONDecodeError, KeyError, IndexError) as e:
                     if attempt == 2:
