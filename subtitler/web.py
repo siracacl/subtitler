@@ -133,16 +133,32 @@ def _reset_progress():
     _progress["total_subs_done"] = 0
     _progress["total_subs_estimate"] = 0
     _progress["eta_seconds"] = 0
+    _progress["_recent_subs"] = []
 
 
 def _update_eta():
-    """Recalculate ETA based on completed subtitles and elapsed time."""
+    """Recalculate ETA based on completed subtitles and elapsed time.
+
+    Uses a rolling window of recent completions rather than the cumulative
+    average — the initial library scan/extraction otherwise dominates the
+    average and inflates the ETA by orders of magnitude.
+    """
     done = _progress["total_subs_done"]
     total = _progress["total_subs_estimate"]
     if done < 1 or total < 1:
         return
-    elapsed = time.time() - _progress["start_time"]
-    avg_per_sub = elapsed / done
+    now = time.time()
+    window = _progress.setdefault("_recent_subs", [])
+    window.append((now, done))
+    # Keep ~5 minutes of history
+    while len(window) > 2 and now - window[0][0] > 300:
+        window.pop(0)
+    span = now - window[0][0]
+    subs_in_window = done - window[0][1]
+    if subs_in_window >= 5 and span > 1:
+        avg_per_sub = span / subs_in_window
+    else:
+        avg_per_sub = (now - _progress["start_time"]) / done
     remaining = total - done
     eta_seconds = avg_per_sub * remaining
     _progress["eta_seconds"] = eta_seconds
