@@ -118,6 +118,10 @@ class OCRClient:
             if "minimax" in self.model.lower():
                 # MiniMax-M3 turn off thinking
                 payload["thinking"] = {"type": "disabled"}
+            if "openrouter" in self.base_url.lower():
+                # OpenRouter's unified switch: disables thinking on reasoning
+                # models (e.g. Qwen3.x); ignored by models without reasoning.
+                payload["reasoning"] = {"enabled": False}
 
             url = f"{self.base_url.rstrip('/')}/chat/completions"
 
