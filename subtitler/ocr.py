@@ -125,13 +125,15 @@ class OCRClient:
 
             url = f"{self.base_url.rstrip('/')}/chat/completions"
 
+            rate_limit_waits = 0
             for attempt in range(3):
                 try:
                     resp = await self.client.post(url, json=payload)
-                    if resp.status_code == 429:
+                    while resp.status_code == 429 and rate_limit_waits < 30:
+                        rate_limit_waits += 1
                         retry_after = float(resp.headers.get("retry-after", "2"))
-                        await asyncio.sleep(retry_after)
-                        continue
+                        await asyncio.sleep(min(retry_after, 30.0))
+                        resp = await self.client.post(url, json=payload)
                     resp.raise_for_status()
                     data = resp.json()
                     content = data["choices"][0]["message"]["content"]
