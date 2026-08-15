@@ -513,13 +513,12 @@ def parse_vobsub_binary(
 
     sub_data = vob_path.read_bytes()
     packets = _scan_all_pes_packets(sub_data)
-    timestamp_entries = _get_timestamps_from_ffprobe(source_file, stream_index)
 
     palette_16 = _extract_palette_from_mkv(source_file, stream_index)
     if not palette_16:
         palette_16 = [(i * 17, i * 17, i * 17) for i in range(16)]
 
-    frames = []
+    decoded = []
     for i, (timestamp_ms, pkt_data) in enumerate(packets):
         if len(pkt_data) < 10:
             continue
@@ -548,6 +547,16 @@ def parse_vobsub_binary(
         bg = Image.new("RGB", img.size, (0, 0, 0))
         bg.paste(img, mask=img.split()[3])
 
+        decoded.append((i, timestamp_ms, duration_ms, bg))
+
+    # ffprobe re-reads the whole source file just for packet durations, so
+    # only fall back to it when some SPU carries no usable duration itself.
+    timestamp_entries = []
+    if any(d is None or d <= 0 for _, _, d, _ in decoded):
+        timestamp_entries = _get_timestamps_from_ffprobe(source_file, stream_index)
+
+    frames = []
+    for i, timestamp_ms, duration_ms, bg in decoded:
         # Find end time. Preference: SPU-internal duration (DCSQ StopDisplay
         # delay) > container packet duration > next subtitle start > 5s default.
         end_ms = 0

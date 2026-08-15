@@ -64,13 +64,13 @@ def _prepare_stream(ps: PreparedStream) -> PreparedStream:
     """Extract, render overlay, and extract frames. Runs in a thread."""
     stream = ps.stream
     try:
-        # Extract subtitle stream
-        extracted = extract_stream(stream, ps.tmp_dir)
-
         if stream.is_pgs:
             from .parsers.pgs import parse_pgs
+            extracted = extract_stream(stream, ps.tmp_dir)
             ps.frames = parse_pgs(extracted)
         elif stream.is_vobsub:
+            # parse_vobsub_binary does its own extraction — don't read the
+            # whole source file once more for nothing.
             from .parsers.vobsub import parse_vobsub_binary
             ps.frames = parse_vobsub_binary(stream.source_file, stream.index, ps.tmp_dir)
         else:
