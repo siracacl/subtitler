@@ -171,23 +171,45 @@ def _update_eta():
     })
 
 
-def _prepare_one_stream(stream, tmp_dir, label, si):
-    """Extract + render + extract frames for a single stream. Runs in a thread."""
-    try:
-        if stream.is_pgs:
-            from .parsers.pgs import parse_pgs
-            extracted = extract_stream(stream, tmp_dir)
-            return parse_pgs(extracted), None
-        elif stream.is_vobsub:
-            # parse_vobsub_binary does its own extraction — don't read the
-            # whole source file once more for nothing.
-            from .parsers.vobsub import parse_vobsub_binary
-            frames = parse_vobsub_binary(stream.source_file, stream.index, tmp_dir)
-            return frames, None
-        else:
-            return [], f"Unsupported codec: {stream.codec}"
-    except Exception as e:
-        return [], str(e)
+def _prepare_one_video(work_items):
+    """Extract + parse ALL streams of one video. Runs in a thread.
+
+    Extracting each stream separately costs one full read of the video file
+    per stream — brutal on network shares. All VobSub streams are therefore
+    demuxed in a single ffmpeg pass; results are per-stream (frames, error)."""
+    from .parsers.vobsub import extract_vobsub_batch, parse_vobsub_binary
+
+    results = []
+    vobsub_items = [it for it in work_items if it[1].is_vobsub]
+    vobs: dict[int, Path] = {}
+    batch_error = None
+    if vobsub_items:
+        try:
+            source = vobsub_items[0][1].source_file
+            indices = [it[1].index for it in vobsub_items]
+            vobs = extract_vobsub_batch(source, indices, vobsub_items[0][4])
+        except Exception as e:
+            batch_error = str(e)
+
+    for item in work_items:
+        _, stream, _, _, tmp_dir = item
+        try:
+            if stream.is_pgs:
+                from .parsers.pgs import parse_pgs
+                extracted = extract_stream(stream, tmp_dir)
+                results.append((item, parse_pgs(extracted), None))
+            elif stream.is_vobsub:
+                vob = vobs.get(stream.index)
+                if vob is None:
+                    results.append((item, [], batch_error or "extraction produced no data"))
+                    continue
+                frames = parse_vobsub_binary(stream.source_file, stream.index, tmp_dir, vob_path=vob)
+                results.append((item, frames, None))
+            else:
+                results.append((item, [], f"Unsupported codec: {stream.codec}"))
+        except Exception as e:
+            results.append((item, [], str(e)))
+    return results
 
 
 def _check_stop():
@@ -276,10 +298,12 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
             # Global extraction pool with cross-video lookahead: extraction of
             # upcoming episodes runs while the current stream is in OCR, so
             # the API never sits idle waiting for the next file to be read.
-            extract_pool = ThreadPoolExecutor(max_workers=6)
-            pending: dict = {}  # future -> (si, stream, label, out_path, tmp_dir)
+            # One job = one video (single read of the file for all streams);
+            # only 2 concurrent reads so a shared network link stays fast.
+            extract_pool = ThreadPoolExecutor(max_workers=2)
+            pending: dict = {}  # future -> video_path
             next_video = 0
-            LOOKAHEAD_STREAMS = 8
+            LOOKAHEAD_VIDEOS = 3
 
             def _queue_one_video():
                 """Queue extractions for the next video that has work. Returns False when exhausted."""
@@ -322,103 +346,103 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
                             "total_streams": len(all_streams),
                         })
                         _broadcast("stream_phase", {"stream_idx": si, "phase": "Extracting..."})
-                        fut = extract_pool.submit(_prepare_one_stream, stream, tmp_dir, label, si)
-                        pending[fut] = (si, stream, label, out_path, tmp_dir)
+                    fut = extract_pool.submit(_prepare_one_video, work_items)
+                    pending[fut] = video_path
                     return True
                 return False
 
-            # OCR each stream as soon as its extraction completes, topping up
-            # the extraction queue so it stays ahead of OCR.
+            # OCR each video's streams as soon as its extraction completes,
+            # topping up the extraction queue so it stays ahead of OCR.
             while True:
                 _check_stop()
-                while len(pending) < LOOKAHEAD_STREAMS:
+                while len(pending) < LOOKAHEAD_VIDEOS:
                     if not _queue_one_video():
                         break
                 if not pending:
                     break
                 done_futs, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
                 fut = next(iter(done_futs))
-                si, stream, label, out_path, tmp_dir = pending.pop(fut)
-                frames, error = fut.result()
+                pending.pop(fut)
+                for (si, stream, label, out_path, tmp_dir), frames, error in fut.result():
 
-                if error:
-                    _broadcast("stream_error", {"stream_idx": si, "error": error})
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                    _progress["done_streams"] += 1
-                    continue
-                if not frames:
-                    _broadcast("stream_error", {"stream_idx": si, "error": "No frames found"})
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                    _progress["done_streams"] += 1
-                    continue
+                    if error:
+                        _broadcast("stream_error", {"stream_idx": si, "error": error})
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        _progress["done_streams"] += 1
+                        continue
+                    if not frames:
+                        _broadcast("stream_error", {"stream_idx": si, "error": "No frames found"})
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        _progress["done_streams"] += 1
+                        continue
 
-                _broadcast("stream_phase", {
-                    "stream_idx": si,
-                    "phase": f"{len(frames)} frames ready, starting OCR...",
-                })
-
-                # Track frame counts for ETA estimation
-                _eta_frame_counts.append(len(frames))
-                avg_frames = sum(_eta_frame_counts) / len(_eta_frame_counts)
-                remaining_streams = max(0, _progress["total_streams"] - _progress["done_streams"] - 1)
-                _progress["total_subs_estimate"] = int(
-                    _progress["total_subs_done"] + len(frames) +
-                    remaining_streams * avg_frames
-                )
-
-                _check_stop()
-
-                codec = "PGS" if stream.is_pgs else "VobSub"
-                label = f"{stream.source_file.stem} [{codec} {stream.lang_code}]"
-
-                _broadcast("stream_ocr_start", {
-                    "stream_idx": si,
-                    "total_frames": len(frames),
-                })
-                _progress["current_label"] = label
-                _progress["current_completed"] = 0
-                _progress["current_total"] = len(frames)
-                _progress["current_text"] = ""
-
-                completed = 0
-
-                def on_progress(idx, result, _si=si, _total=len(frames)):
-                    nonlocal completed
-                    completed += 1
-                    _progress["total_subs_done"] += 1
-                    txt = truncate(result.text, 80) if result.text else ""
-                    _progress["current_completed"] = completed
-                    _progress["current_text"] = txt
-                    _broadcast("stream_ocr_progress", {
-                        "stream_idx": _si,
-                        "completed": completed,
-                        "total": _total,
-                        "text": txt,
+                    _broadcast("stream_phase", {
+                        "stream_idx": si,
+                        "phase": f"{len(frames)} frames ready, starting OCR...",
                     })
-                    # Update ETA every 5 subtitles to avoid spamming
-                    if _progress["total_subs_done"] % 5 == 0 or completed == _total:
-                        _update_eta()
 
-                results = loop.run_until_complete(
-                    ocr_client.ocr_frames(frames, stream.language, on_progress)
-                )
+                    # Track frame counts for ETA estimation
+                    _eta_frame_counts.append(len(frames))
+                    avg_frames = sum(_eta_frame_counts) / len(_eta_frame_counts)
+                    remaining_streams = max(0, _progress["total_streams"] - _progress["done_streams"] - 1)
+                    _progress["total_subs_estimate"] = int(
+                        _progress["total_subs_done"] + len(frames) +
+                        remaining_streams * avg_frames
+                    )
 
-                _check_stop()
+                    _check_stop()
 
-                # Filter out stopped results
-                results = [r for r in results if r.text != "[STOPPED]"]
-                write_subtitles(results, out_path, config.output_format)
-                errors = sum(1 for r in results if r.text.startswith("[OCR ERROR"))
-                _progress["done_streams"] += 1
-                _log(f"Done: {out_path.name} ({len(frames)} frames, {errors} errors)")
-                _broadcast("stream_done", {
-                    "stream_idx": si,
-                    "output": out_path.name,
-                    "total_frames": len(frames),
-                    "errors": errors,
-                })
+                    codec = "PGS" if stream.is_pgs else "VobSub"
+                    label = f"{stream.source_file.stem} [{codec} {stream.lang_code}]"
 
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                    _broadcast("stream_ocr_start", {
+                        "stream_idx": si,
+                        "total_frames": len(frames),
+                    })
+                    _progress["current_label"] = label
+                    _progress["current_completed"] = 0
+                    _progress["current_total"] = len(frames)
+                    _progress["current_text"] = ""
+
+                    completed = 0
+
+                    def on_progress(idx, result, _si=si, _total=len(frames)):
+                        nonlocal completed
+                        completed += 1
+                        _progress["total_subs_done"] += 1
+                        txt = truncate(result.text, 80) if result.text else ""
+                        _progress["current_completed"] = completed
+                        _progress["current_text"] = txt
+                        _broadcast("stream_ocr_progress", {
+                            "stream_idx": _si,
+                            "completed": completed,
+                            "total": _total,
+                            "text": txt,
+                        })
+                        # Update ETA every 5 subtitles to avoid spamming
+                        if _progress["total_subs_done"] % 5 == 0 or completed == _total:
+                            _update_eta()
+
+                    results = loop.run_until_complete(
+                        ocr_client.ocr_frames(frames, stream.language, on_progress)
+                    )
+
+                    _check_stop()
+
+                    # Filter out stopped results
+                    results = [r for r in results if r.text != "[STOPPED]"]
+                    write_subtitles(results, out_path, config.output_format)
+                    errors = sum(1 for r in results if r.text.startswith("[OCR ERROR"))
+                    _progress["done_streams"] += 1
+                    _log(f"Done: {out_path.name} ({len(frames)} frames, {errors} errors)")
+                    _broadcast("stream_done", {
+                        "stream_idx": si,
+                        "output": out_path.name,
+                        "total_frames": len(frames),
+                        "errors": errors,
+                    })
+
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
 
         finally:
             extract_pool.shutdown(wait=False, cancel_futures=True)

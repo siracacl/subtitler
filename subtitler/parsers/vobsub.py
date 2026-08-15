@@ -462,10 +462,34 @@ def _extract_sub_vob(source_file: Path, stream_index: int, work_dir: Path) -> Pa
         "-c:s", "copy", "-f", "mpeg",
         str(vob_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    # Generous timeout: a full read of a large file over a busy network share
+    # can take many minutes.
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if result.returncode == 0 and vob_path.exists() and vob_path.stat().st_size > 0:
         return vob_path
     return None
+
+
+def extract_vobsub_batch(
+    source_file: Path, stream_indices: list[int], work_dir: Path
+) -> dict[int, Path]:
+    """Extract several VobSub streams in ONE pass over the source file.
+
+    Each stream normally costs a full read of the video; on network shares
+    that read dominates everything. One ffmpeg invocation with multiple
+    outputs demuxes all streams in a single pass. Returns {stream_index: vob}
+    for streams that produced data."""
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(source_file)]
+    out_paths: dict[int, Path] = {}
+    for idx in stream_indices:
+        p = work_dir / f"subs_{idx}.vob"
+        cmd += ["-map", f"0:{idx}", "-c:s", "copy", "-f", "mpeg", str(p)]
+        out_paths[idx] = p
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if result.returncode != 0:
+        # Fall back to whatever partial outputs exist; callers handle misses.
+        pass
+    return {i: p for i, p in out_paths.items() if p.exists() and p.stat().st_size > 0}
 
 
 def _get_timestamps_from_ffprobe(source_file: Path, stream_index: int) -> list[tuple[int, int]]:
@@ -505,9 +529,14 @@ def parse_vobsub_binary(
     source_file: Path,
     stream_index: int,
     work_dir: Path,
+    vob_path: Path | None = None,
 ) -> list[SubtitleFrame]:
-    """Parse VobSub directly from binary using SubtitleEdit's SubPicture decoder."""
-    vob_path = _extract_sub_vob(source_file, stream_index, work_dir)
+    """Parse VobSub directly from binary using SubtitleEdit's SubPicture decoder.
+
+    Pass vob_path to reuse an already-extracted .vob (see
+    extract_vobsub_batch); otherwise the stream is extracted here."""
+    if vob_path is None:
+        vob_path = _extract_sub_vob(source_file, stream_index, work_dir)
     if vob_path is None:
         return []
 
