@@ -30,3 +30,4 @@ Thumbs.db
 tmp/
 
 *.mkv
+test_frames/
