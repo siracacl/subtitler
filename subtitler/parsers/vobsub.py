@@ -114,6 +114,20 @@ def _generate_bitmap(data: bytes, pixels, width: int, height: int,
             x += 1
 
 
+def _resync_spu(data: bytes) -> bytes:
+    """Some rips prepend a few junk bytes to an SPU (seen on first packets of
+    DVD streams). If the size field contradicts the packet length, look for a
+    nearby offset where a consistent SPU header begins."""
+    if _get_endian_word(data, 0) <= len(data):
+        return data
+    for off in range(1, 9):
+        size = _get_endian_word(data, off)
+        dcsq = _get_endian_word(data, off + 2)
+        if size == len(data) - off and dcsq < size:
+            return data[off:]
+    return data
+
+
 def _parse_sub_picture(
     data: bytes, palette_16: list[tuple[int, int, int]]
 ) -> tuple[Image.Image, bool, int | None] | None:
@@ -125,7 +139,7 @@ def _parse_sub_picture(
     if len(data) < 4:
         return None
 
-    sub_picture_data_size = _get_endian_word(data, 0)
+    data = _resync_spu(data)
     start_dcsq_address = _get_endian_word(data, 2)
 
     # Default four colors: background, pattern, emphasis1, emphasis2
