@@ -298,12 +298,14 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
             # Global extraction pool with cross-video lookahead: extraction of
             # upcoming episodes runs while the current stream is in OCR, so
             # the API never sits idle waiting for the next file to be read.
-            # One job = one video (single read of the file for all streams);
-            # only 2 concurrent reads so a shared network link stays fast.
-            extract_pool = ThreadPoolExecutor(max_workers=2)
+            # One job = one video (single read of the file for all streams).
+            # Default 1 worker: on a bandwidth-limited share, sequential full
+            # reads are fastest; the lookahead still keeps one video buffered
+            # and one extracting while OCR runs.
+            extract_pool = ThreadPoolExecutor(max_workers=max(1, config.extract_workers))
             pending: dict = {}  # future -> video_path
             next_video = 0
-            LOOKAHEAD_VIDEOS = 3
+            LOOKAHEAD_VIDEOS = max(1, config.extract_workers) + 2
 
             def _queue_one_video():
                 """Queue extractions for the next video that has work. Returns False when exhausted."""

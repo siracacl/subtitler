@@ -38,6 +38,10 @@ class Config:
     dry_run: bool = False
     output_dir: str | None = None
     input_path: str = "."
+    # Concurrent video extractions. 1 is optimal when the source files sit on
+    # a bandwidth-limited network share (parallel full-file reads just split
+    # the link); raise for fast local disks.
+    extract_workers: int = 1
 
 
 def find_config_file() -> Path | None:
@@ -60,6 +64,7 @@ _ENV_MAP = {
     "SUBTITLER_LANGUAGE": ("language", list),
     "SUBTITLER_FORCED_ONLY": ("forced_only", bool),
     "SUBTITLER_OUTPUT_DIR": ("output_dir", str),
+    "SUBTITLER_EXTRACT_WORKERS": ("extract_workers", int),
 }
 
 
