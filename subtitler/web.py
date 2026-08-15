@@ -179,6 +179,11 @@ def _prepare_one_video(work_items):
     demuxed in a single ffmpeg pass; results are per-stream (frames, error)."""
     from .parsers.vobsub import extract_vobsub_batch, parse_vobsub_binary
 
+    # Announce the actual start of extraction from the worker thread — items
+    # sitting in the lookahead queue must not claim to be extracting already.
+    for si, _, _, _, _ in work_items:
+        _broadcast("stream_phase", {"stream_idx": si, "phase": "Extracting..."})
+
     results = []
     vobsub_items = [it for it in work_items if it[1].is_vobsub]
     vobs: dict[int, Path] = {}
@@ -347,7 +352,7 @@ def _run_pipeline(config: Config, servers: list[ServerConfig] | None = None):
                             "stream_idx": si, "label": label,
                             "total_streams": len(all_streams),
                         })
-                        _broadcast("stream_phase", {"stream_idx": si, "phase": "Extracting..."})
+                        _broadcast("stream_phase", {"stream_idx": si, "phase": "Queued"})
                     fut = extract_pool.submit(_prepare_one_video, work_items)
                     pending[fut] = video_path
                     return True
