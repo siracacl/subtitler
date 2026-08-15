@@ -114,9 +114,13 @@ def _generate_bitmap(data: bytes, pixels, width: int, height: int,
             x += 1
 
 
-def _parse_sub_picture(data: bytes, palette_16: list[tuple[int, int, int]]) -> Image.Image | None:
+def _parse_sub_picture(
+    data: bytes, palette_16: list[tuple[int, int, int]]
+) -> tuple[Image.Image, bool, int | None] | None:
     """Parse a complete DVD SubPicture Unit (SPU) into an image.
     Faithful port of SubtitleEdit SubPicture.ParseDisplayControlCommands + GenerateBitmap.
+    Returns (image, forced, duration_ms) — duration_ms comes from the DCSQ delay
+    of the StopDisplay command, or None if the SPU has no StopDisplay.
     """
     if len(data) < 4:
         return None
@@ -132,6 +136,7 @@ def _parse_sub_picture(data: bytes, palette_16: list[tuple[int, int, int]]) -> I
     x1, y1, x2, y2 = 0, 0, 0, 0
     forced = False
     display_area_set = False
+    duration_ms = None
 
     # Walk the display control sequence table chain
     dcsq_address = start_dcsq_address
@@ -142,6 +147,10 @@ def _parse_sub_picture(data: bytes, palette_16: list[tuple[int, int, int]]) -> I
 
         if dcsq_address + 4 >= len(data):
             break
+
+        # Each DCSQ starts with a 2-byte delay: time relative to the SPU's PTS
+        # at which its commands execute, in (90kHz >> 10) ticks.
+        delay_before_execute = _get_endian_word(data, dcsq_address)
 
         command_index = dcsq_address + 4
         if command_index >= len(data):
@@ -159,6 +168,9 @@ def _parse_sub_picture(data: bytes, palette_16: list[tuple[int, int, int]]) -> I
             elif command == 0x01:  # StartDisplay
                 command_index += 1
             elif command == 0x02:  # StopDisplay
+                # The delay of the DCSQ carrying StopDisplay is the actual
+                # display duration (SubtitleEdit: Delay = (delay << 10) / 90.0).
+                duration_ms = int((delay_before_execute << 10) / 90.0)
                 command_index += 1
             elif command == 0x03:  # SetColor
                 if command_index + 2 < len(data) and palette_16:
@@ -233,7 +245,7 @@ def _parse_sub_picture(data: bytes, palette_16: list[tuple[int, int, int]]) -> I
     _generate_bitmap(data, pixels, width, height, 0, image_top_field, four_colors, 2)
     _generate_bitmap(data, pixels, width, height, 1, image_bottom_field, four_colors, 2)
 
-    return img, forced
+    return img, forced, duration_ms
 
 
 # ---------------------------------------------------------------------------
@@ -350,23 +362,31 @@ def _scan_all_pes_packets(data: bytes) -> list[tuple[int, bytes]]:
             raw_packets.append((pts, payload))
         pos = max(idx + 1, next_pos)
 
+    # A packet with a PTS always starts a new subtitle; packets without PTS are
+    # continuations. Never wait for the SPU size field to be satisfied — a
+    # corrupt size in one SPU would swallow all following subtitles.
     subtitles = []
     current_data = bytearray()
     current_pts = None
-    expected_size = 0
+
+    def _flush():
+        if not current_data or current_pts is None:
+            return
+        expected_size = struct.unpack(">H", current_data[:2])[0] if len(current_data) >= 2 else 0
+        if 0 < expected_size <= len(current_data):
+            subtitles.append((current_pts, bytes(current_data[:expected_size])))
+        else:
+            subtitles.append((current_pts, bytes(current_data)))
 
     for pts, payload in raw_packets:
-        if pts is not None and (not current_data or len(current_data) >= expected_size):
-            if current_data and expected_size > 0:
-                subtitles.append((current_pts, bytes(current_data[:expected_size])))
+        if pts is not None:
+            _flush()
             current_data = bytearray(payload)
             current_pts = pts
-            expected_size = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else 0
-        else:
+        elif current_data:
             current_data.extend(payload)
 
-    if current_data and expected_size > 0:
-        subtitles.append((current_pts, bytes(current_data[:expected_size])))
+    _flush()
 
     return [(int(pts / 90) if pts else 0, d) for pts, d in subtitles]
 
@@ -453,10 +473,12 @@ def _get_timestamps_from_ffprobe(source_file: Path, stream_index: int) -> list[t
             dur = float(pkt.get("duration_time", "0"))
         except (ValueError, TypeError):
             continue
-        if pts <= 0 and dur <= 0:
+        # Only packets with a real duration are useful; most muxers (e.g.
+        # Matroska via ffprobe) report none for dvd_subtitle packets.
+        if pts <= 0 or dur <= 0:
             continue
         start_ms = int(pts * 1000)
-        end_ms = int((pts + dur) * 1000) if dur > 0 else start_ms + 5000
+        end_ms = int((pts + dur) * 1000)
         entries.append((start_ms, end_ms))
     return entries
 
@@ -491,7 +513,7 @@ def parse_vobsub_binary(
         result = _parse_sub_picture(pkt_data, palette_16)
         if result is None:
             continue
-        img, forced = result
+        img, forced, duration_ms = result
 
         # Crop to non-transparent content
         bbox = img.getbbox()
@@ -512,15 +534,25 @@ def parse_vobsub_binary(
         bg = Image.new("RGB", img.size, (0, 0, 0))
         bg.paste(img, mask=img.split()[3])
 
-        # Find end time
-        end_ms = timestamp_ms + 5000
-        if timestamp_entries:
+        # Find end time. Preference: SPU-internal duration (DCSQ StopDisplay
+        # delay) > container packet duration > next subtitle start > 5s default.
+        end_ms = 0
+        if duration_ms is not None and duration_ms > 0:
+            end_ms = timestamp_ms + duration_ms
+        else:
             for ts_start, ts_end in timestamp_entries:
-                if abs(ts_start - timestamp_ms) < 100:
+                if abs(ts_start - timestamp_ms) < 100 and ts_end > timestamp_ms:
                     end_ms = ts_end
                     break
-        elif i + 1 < len(packets):
-            end_ms = packets[i + 1][0]
+        if end_ms <= timestamp_ms:
+            if i + 1 < len(packets) and packets[i + 1][0] > timestamp_ms:
+                end_ms = packets[i + 1][0]
+            else:
+                end_ms = timestamp_ms + 5000
+        # Never overlap into the next subtitle — a DVD player would replace
+        # the display at that point anyway.
+        if i + 1 < len(packets) and packets[i + 1][0] > timestamp_ms:
+            end_ms = min(end_ms, packets[i + 1][0])
 
         buf = io.BytesIO()
         bg.save(buf, format="PNG")
